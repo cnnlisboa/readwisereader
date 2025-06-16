@@ -16,7 +16,7 @@ Installation:
 ```
 -- ./settings/readwisereader.lua
 return {
-    ["readwisereader"] = {
+		["readwisereader"] = {
 		["access_token"] = "{access token}"
         ["available_locations"] = {},
         ["available_tags"] = {},
