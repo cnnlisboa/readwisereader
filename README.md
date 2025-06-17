@@ -8,7 +8,8 @@ Key features:
 - Particular types of article, locations and document tags can be excluded from syncing in the settings menu.
 
 Installation:
-- Attach your ereader to your computer. Copy the readwisereader.koplugin folder containing _meta.lua and main.lua to the koreader/plugins folder. Restart KOReader.
+- Download the ZIP file of the plugin [here](https://github.com/tomtom800/readwisereader/archive/refs/heads/main.zip). Extract it.
+- Attach your ereader to your computer. Copy the readwisereader.koplugin folder containing _meta.lua and main.lua from the extracted folder to the koreader/plugins folder. Restart KOReader.
 - The plugin requires a Readwise access token, which can be obtained for free [here](readwisereader.koplugin). 
 - The token can be typed in manually in the Readwise Reader/Settings/Configure Readwise Reader menu, but this is difficult to do correctly. The letter O and the number 0, are easily confused as are the lowercase letter l, the uppercase letter I and the numeral 1. If this the plugin is not working, check this first.
 - You may prefer to copy and paste the access token directly from your computer into KOReader settings. To do this, first set the folder you want to download to in the Readwise Reader/Settings/Download folder menu. This will create the file koreader/settings/readwisereader.lua. Add the access token to this file in the following format:
