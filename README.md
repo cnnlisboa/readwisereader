@@ -1,5 +1,5 @@
 # A KOReader plugin for Readwise Reader
-A simple plugin for KOReader integration with Readwise Reader.
+A simple plugin for KOReader integration with the read later service Readwise Reader. A Readwise subscription is required. 
 Key features:
 - Articles in Readwise Reader saved to “Later” or “Shortlist” are downloaded to KOReader as HTML files.
 - Images are downloaded where this is possible.
