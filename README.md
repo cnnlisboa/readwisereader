@@ -1,4 +1,4 @@
-# A Koreader plugin for Readwise Reader
+# A KOReader plugin for Readwise Reader
 A simple plugin for KOReader integration with Readwise Reader.
 Key features:
 - Articles in Readwise Reader saved to “Later” or “Shortlist” are downloaded to KOReader as HTML files.
