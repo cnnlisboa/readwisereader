@@ -3,7 +3,7 @@ A simple plugin for KOReader integration with the read later service Readwise Re
 Key features:
 - Articles in Readwise Reader saved to “Later” or “Shortlist” are downloaded to KOReader as HTML files.
 - Images are downloaded where this is possible.
-- Articles which have been read in KOReader and marked as complete will be moved to the Readwise Reader Archive at the next sync, and deleted from KOReader.
+- Articles which have been read in KOReader and marked as “finished” will be moved to the Readwise Reader Archive at the next sync, and deleted from KOReader.
 - At sync, articles which have been archived in Readwise Reader will be deleted from KOReader.
 - Particular types of article, locations and document tags can be excluded from syncing in the settings menu.
 
