@@ -717,7 +717,7 @@ function ReadwiseReader:getDocumentList()
             
             if result.results then
                 for _, doc in ipairs(result.results) do
-                    if (doc.category == "article" or doc.category == "pdf") and doc.reading_progress < 1 then
+                    if doc.reading_progress < 1 then
                         table.insert(documents, doc)
                     end
                 end
@@ -759,9 +759,7 @@ function ReadwiseReader:getArchivedDocuments(since_date)
         
         if result.results then
             for _, doc in ipairs(result.results) do
-                if doc.category == "article" or doc.category == "pdf" then
-                    table.insert(documents, doc)
-                end
+                table.insert(documents, doc)
             end
         end
         
@@ -849,7 +847,7 @@ function ReadwiseReader:downloadDocument(document)
     
     local content = document.html_content
     
-    if not content or content == "" then
+    if not content or content == "" or type(content) ~= "string" then
         logger.warn("ReadwiseReader:downloadDocument: no HTML content available for", document.id)
         
         local basic_content = string.format([[
