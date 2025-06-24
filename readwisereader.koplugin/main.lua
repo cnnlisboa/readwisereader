@@ -461,12 +461,15 @@ function ReadwiseReader:updateAvailableTags(documents)
             end
         end
         
+        -- Fixed tag processing - handle the actual API structure
         if doc.tags and type(doc.tags) == "table" then
             logger.dbg("ReadwiseReader:updateAvailableTags: found tags object for document", doc.id)
             
-            for tag_name, tag_data in pairs(doc.tags) do
-                if type(tag_name) == "string" and tag_name ~= "" then
-                    logger.dbg("ReadwiseReader:updateAvailableTags: found tag:", tag_name)
+            -- Iterate through tag objects and extract the 'name' field
+            for tag_id, tag_data in pairs(doc.tags) do
+                if type(tag_data) == "table" and tag_data.name and type(tag_data.name) == "string" and tag_data.name ~= "" then
+                    local tag_name = tag_data.name
+                    logger.dbg("ReadwiseReader:updateAvailableTags: found tag:", tag_name, "with id:", tag_id)
                     
                     table.insert(self.document_tags[doc.id], tag_name)
                     
