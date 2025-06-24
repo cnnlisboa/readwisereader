@@ -6,6 +6,7 @@ Key features:
 - Articles which have been read in KOReader and marked as “finished” will be moved to the Readwise Reader Archive at the next sync, and deleted from KOReader.
 - At sync, articles which have been archived in Readwise Reader will be deleted from KOReader.
 - Particular types of article, locations and document tags can be excluded from syncing in the settings menu.
+- Exports highlights and notes to Readwise in the same sync process (disabled by default - enable in the settings menu). Unfortunately two way syncing is not possible as the Readwise Reader API does not provide the location data required by KOReader.
 
 Installation:
 - Download the ZIP file of the plugin [here](https://github.com/tomtom800/readwisereader/archive/refs/heads/main.zip). Extract it.
