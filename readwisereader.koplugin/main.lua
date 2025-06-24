@@ -1,13 +1,15 @@
 -- ===============================================================================
--- KOREADER READWISE READER PLUGIN
+-- KOREADER READWISE READER PLUGIN WITH HIGHLIGHTS EXPORT
 -- ===============================================================================
--- This plugin synchronizes articles from Readwise Reader to KOReader
+-- This plugin synchronizes articles from Readwise Reader to KOReader and
+-- exports highlights/notes back to Readwise
 -- 
 -- MAIN FEATURES:
 -- - Downloads articles from Readwise Reader "later" and "shortlist" locations
 -- - Converts articles to HTML format with embedded images
 -- - Offers filtering by article tags, location and type
 -- - Archives finished articles back to Readwise
+-- - Exports highlights and notes to Readwise
 -- - Handles incremental sync with cleanup of archived content
 -- ===============================================================================
 
@@ -23,17 +25,20 @@ local InputDialog = require("ui/widget/inputdialog")
 local JSON = require("json")
 local LuaSettings = require("luasettings")
 local MultiConfirmBox = require("ui/widget/multiconfirmbox")
+local MyClipping = require("clip")
 local NetworkMgr = require("ui/network/manager")
 local ReadHistory = require("readhistory")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 
+local Device = require("device")
 local filemanagerutil = require("apps/filemanager/filemanagerutil")
 local http = require("socket.http")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local ltn12 = require("ltn12")
 local mime = require("mime")
+local rapidjson = require("rapidjson")
 local socket = require("socket")
 local socketutil = require("socketutil")
 local util = require("util")
@@ -42,6 +47,7 @@ local T = FFIUtil.template
 
 -- constants
 local API_ENDPOINT = "https://readwise.io/api/v3"
+local HIGHLIGHTS_API_ENDPOINT = "https://readwise.io/api/v2"
 local article_id_prefix = "[rw-id_"
 local article_id_postfix = "] "
 
@@ -69,6 +75,7 @@ function ReadwiseReader:init()
     self.access_token = settings.access_token
     self.directory = settings.directory
     self.archive_finished = settings.archive_finished
+    self.export_highlights_at_sync = settings.export_highlights_at_sync or false
     self.last_sync_time = settings.last_sync_time
     
     self.available_tags = settings.available_tags or {}
@@ -79,9 +86,160 @@ function ReadwiseReader:init()
     self.available_locations = settings.available_locations or {}
     self.excluded_locations = settings.excluded_locations or {}
     self.document_locations = settings.document_locations or {}
+
+    -- Initialize highlights parser
+    self.parser = MyClipping:new{}
     
     self.ui.menu:registerToMainMenu(self)
 end
+
+-- ===============================================================================
+-- HIGHLIGHTS EXPORT FUNCTIONALITY
+-- ===============================================================================
+
+function ReadwiseReader:makeJsonRequest(endpoint, method, body, headers)
+    local sink = {}
+    local extra_headers = headers or {}
+    local body_json, response, err
+
+    body_json, err = rapidjson.encode(body)
+    if not body_json then
+        return nil, "Cannot encode body: " .. (err or "unknown error")
+    end
+    
+    local source = ltn12.source.string(body_json)
+    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+
+    local request = {
+        url = endpoint,
+        method = method,
+        sink = ltn12.sink.table(sink),
+        source = source,
+        headers = {
+            ["Content-Length"] = #body_json,
+            ["Content-Type"] = "application/json",
+        },
+    }
+
+    -- fill in extra headers
+    for k, v in pairs(extra_headers) do
+        request.headers[k] = v
+    end
+
+    local code, __, status = socket.skip(1, http.request(request))
+    socketutil:reset_timeout()
+
+    if code ~= 200 then
+        return nil, "Request failed: " .. (status or code or "network unreachable")
+    end
+
+    if not sink[1] then
+        return nil, "No response from server"
+    end
+
+    response, err = rapidjson.decode(sink[1])
+    if not response then
+        return nil, "Unable to decode server response: " .. (err or "unknown error")
+    end
+
+    return response
+end
+
+function ReadwiseReader:getDocumentClippings()
+    return self.parser:parseCurrentDoc(self.view) or {}
+end
+
+function ReadwiseReader:parseAllBooks()
+    local clippings = {}
+    
+    -- Parse from history
+    local history_clippings = self.parser:parseHistory()
+    for title, booknotes in pairs(history_clippings) do
+        clippings[title] = booknotes
+    end
+    
+    -- Parse from Kindle My Clippings if available
+    if Device:isKindle() then
+        local kindle_clippings = self.parser:parseMyClippings()
+        for title, booknotes in pairs(kindle_clippings) do
+            if clippings[title] == nil or #clippings[title] < #booknotes then
+                logger.dbg("ReadwiseReader: found new notes in MyClipping", booknotes.title)
+                clippings[title] = booknotes
+            end
+        end
+    end
+    
+    -- Remove empty books
+    for title, booknotes in pairs(clippings) do
+        if #booknotes == 0 then
+            clippings[title] = nil
+        end
+    end
+    
+    return clippings
+end
+
+function ReadwiseReader:createHighlights(booknotes)
+    local highlights = {}
+    local json_headers = {
+        ["Authorization"] = "Token " .. self.access_token,
+    }
+
+    for _, chapter in ipairs(booknotes) do
+        for _, clipping in ipairs(chapter) do
+            local highlight = {
+                text = clipping.text,
+                title = booknotes.title,
+                author = booknotes.author ~= "" and booknotes.author:gsub("\n", ", ") or nil,
+                source_type = "koreader",
+                category = "books",
+                note = clipping.note,
+                location = clipping.page,
+                location_type = "order",
+                highlighted_at = os.date("!%Y-%m-%dT%TZ", clipping.time),
+            }
+            table.insert(highlights, highlight)
+        end
+    end
+
+    local result, err = self:makeJsonRequest(HIGHLIGHTS_API_ENDPOINT .. "/highlights", "POST",
+         { highlights = highlights }, json_headers)
+
+    if not result then
+        logger.warn("ReadwiseReader: error creating highlights", err)
+        return false, err
+    end
+    return true
+end
+
+function ReadwiseReader:exportToReadwise(clippings)
+    local exportables = {}
+    for _title, booknotes in pairs(clippings) do
+        table.insert(exportables, booknotes)
+    end
+    
+    local success_count = 0
+    local errors = {}
+    
+    for _, booknotes in ipairs(exportables) do
+        local success, err = self:createHighlights(booknotes)
+        if success then
+            success_count = success_count + 1
+        else
+            table.insert(errors, booknotes.title .. ": " .. (err or "Unknown error"))
+        end
+    end
+    
+    return success_count, errors
+end
+
+function ReadwiseReader:isDocReady()
+    return self.ui.document and true or false
+end
+
+-- ===============================================================================
+-- MAIN MENU AND UI
+-- ===============================================================================
 
 function ReadwiseReader:addToMainMenu(menu_items)
     menu_items.readwisereader = {
@@ -145,6 +303,16 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                     },
                     {
+                        text = _("Export highlights at each sync"),
+                        checked_func = function() 
+                            return self.export_highlights_at_sync 
+                        end,
+                        callback = function()
+                            self.export_highlights_at_sync = not self.export_highlights_at_sync
+                            self:saveSettings()
+                        end,
+                    },
+                    {
                         text = _("Exclude from sync"),
                         sub_item_table_func = function()
                             return self:getExclusionMenuItems()
@@ -155,6 +323,10 @@ function ReadwiseReader:addToMainMenu(menu_items)
         },
     }
 end
+
+-- ===============================================================================
+-- READER SYNC FUNCTIONALITY (ORIGINAL PLUGIN CODE)
+-- ===============================================================================
 
 function ReadwiseReader:getExclusionMenuItems()
     local menu_items = {}
@@ -1202,6 +1374,17 @@ function ReadwiseReader:synchronize()
     
     local sync_start_time = os.date("!%Y-%m-%dT%H:%M:%SZ")
     
+    -- Export highlights if enabled
+    local highlights_exported = 0
+    if self.export_highlights_at_sync then
+        self:showProgress(_("Exporting highlights to Readwise..."))
+        local clippings = self:parseAllBooks()
+        if next(clippings) ~= nil then
+            highlights_exported, _ = self:exportToReadwise(clippings)
+        end
+        self:hideProgress()
+    end
+    
     local cleaned_count = self:cleanupArchivedDocuments()
     self:hideProgress()
     
@@ -1234,7 +1417,7 @@ function ReadwiseReader:synchronize()
         end
     end
     
-    if #filtered_documents == 0 and cleaned_count == 0 and archived_count == 0 then
+    if #filtered_documents == 0 and cleaned_count == 0 and archived_count == 0 and highlights_exported == 0 then
         local msg = _("No new articles found and no changes to process.")
         if existing_count > 0 then
             msg = msg .. "\n" .. T(_("Skipped %1 existing articles."), existing_count)
@@ -1274,6 +1457,10 @@ function ReadwiseReader:synchronize()
     
     local msg = _("Sync complete:")
     
+    if highlights_exported > 0 then
+        msg = msg .. "\n" .. T(_("Exported highlights: %1 books"), highlights_exported)
+    end
+    
     if downloaded > 0 then
         msg = msg .. "\n" .. T(_("Downloaded: %1"), downloaded)
     end
@@ -1303,7 +1490,7 @@ function ReadwiseReader:synchronize()
         msg = msg .. "\n" .. T(_("Deleted locally: %1"), deleted_count)
     end
     
-    if downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and excluded_count == 0 and existing_count == 0 then
+    if downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and excluded_count == 0 and existing_count == 0 and highlights_exported == 0 then
         msg = msg .. "\n" .. _("No changes to process.")
     end
     
@@ -1326,6 +1513,7 @@ function ReadwiseReader:saveSettings()
         access_token = self.access_token,
         directory = self.directory,
         archive_finished = self.archive_finished,
+        export_highlights_at_sync = self.export_highlights_at_sync,
         last_sync_time = self.last_sync_time,
         available_tags = self.available_tags,
         excluded_tags = self.excluded_tags,
