@@ -1,17 +1,23 @@
 # A KOReader plugin for Readwise Reader
-A simple plugin for KOReader integration with the read later service Readwise Reader. A Readwise subscription is required. 
-Key features:
+A simple plugin for KOReader integration with Readwise’s highlight saving and read later services (Readwise Reader). A Readwise subscription is required. 
+
+## Key features:
 - Articles in Readwise Reader saved to “Later” or “Shortlist” are downloaded to KOReader as HTML files.
 - Images are downloaded where this is possible.
 - Articles which have been read in KOReader and marked as “finished” will be moved to the Readwise Reader Archive at the next sync, and deleted from KOReader.
 - At sync, articles which have been archived in Readwise Reader will be deleted from KOReader.
 - Particular types of article, locations and document tags can be excluded from syncing in the settings menu.
-- Exports highlights and notes to Readwise in the same sync process (disabled by default - enable in the settings menu). Unfortunately two way syncing is not possible as the Readwise Reader API does not provide the location data required by KOReader.
+- Highlights and notes are exported to Readwise in the same sync process (disabled by default - enable in the settings menu). 
 
-Installation:
+## Limitations
+- Unfortunately two way highlight syncing is not possible as the Readwise Reader API does not provide the location data required by KOReader.
+- Readwise Reader’s Highlight Tags are not supported as there is no equivalent in KOReader.
+- Very image heavy files will download, but may cause KOReader to crash if the file is large. I am looking at ways to negate this.
+
+## Installation:
 - Download the ZIP file of the plugin [here](https://github.com/tomtom800/readwisereader/archive/refs/heads/main.zip). Extract it.
 - Attach your ereader to your computer. Copy the `readwisereader.koplugin` folder containing _meta.lua and main.lua from the extracted folder to the `koreader/plugins` folder. Restart KOReader.
-- The plugin requires a Readwise access token, which can be obtained for free [here](https://readwise.io/access_token). 
+- The plugin requires a Readwise access token, which subscribers can obtain  [here](https://readwise.io/access_token). 
 - The token can be typed in manually in the Readwise Reader/Settings/Configure Readwise Reader menu, but this is difficult to do correctly. The letter O and the number 0, are easily confused as are the lowercase letter l, the uppercase letter I and the numeral 1. If the plugin is not working, check this first.
 - You may prefer to copy and paste the access token directly from your computer into KOReader settings. To do this, first set the folder you want to download to in the Readwise Reader/Settings/Download folder menu. This will create the file koreader/settings/readwisereader.lua. Add the access token to this file in the following format:
 
