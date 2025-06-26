@@ -1,4 +1,4 @@
-# A KOReader plugin for Readwise Reader
+# A KOReader plugin for Readwise and Readwise Reader
 A simple plugin for KOReader integration with Readwise’s highlight saving and read later services (Readwise Reader). A Readwise subscription is required. 
 
 ## Key features:
