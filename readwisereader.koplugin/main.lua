@@ -11,6 +11,7 @@
 -- - Archives finished articles back to Readwise
 -- - Exports highlights and notes to Readwise
 -- - Handles incremental sync with cleanup of archived content
+-- - Fixed author metadata handling for proper highlight export
 -- ===============================================================================
 
 local BD = require("ui/bidi")
@@ -61,7 +62,7 @@ function ReadwiseReader:onDispatcherRegisterActions()
     Dispatcher:registerAction("readwisereader_download", { 
         category = "none", 
         event = "SynchronizeReadwiseReader", 
-        title = _("Readwise Reader sync"), 
+        title = "Readwise Reader sync", 
         general = true,
     })
 end
@@ -86,11 +87,61 @@ function ReadwiseReader:init()
     self.available_locations = settings.available_locations or {}
     self.excluded_locations = settings.excluded_locations or {}
     self.document_locations = settings.document_locations or {}
+    
+    -- Initialize author metadata storage
+    self.document_authors = settings.document_authors or {}
 
     -- Initialize highlights parser
     self.parser = MyClipping:new{}
     
     self.ui.menu:registerToMainMenu(self)
+end
+
+-- ===============================================================================
+-- AUTHOR METADATA STORAGE AND RETRIEVAL FUNCTIONS
+-- ===============================================================================
+
+function ReadwiseReader:storeAuthorMetadata(document_id, author)
+    -- Store author metadata against document ID
+    if not self.document_authors then
+        self.document_authors = {}
+    end
+    
+    if author and type(author) == "string" and author ~= "" then
+        self.document_authors[document_id] = author
+        logger.dbg("ReadwiseReader:storeAuthorMetadata: stored author for document", document_id, ":", author)
+    else
+        self.document_authors[document_id] = nil
+        logger.dbg("ReadwiseReader:storeAuthorMetadata: no valid author for document", document_id)
+    end
+    
+    self:saveSettings()
+end
+
+function ReadwiseReader:getStoredAuthor(document_id)
+    -- Retrieve stored author metadata for a document
+    if self.document_authors and self.document_authors[document_id] then
+        return self.document_authors[document_id]
+    end
+    return nil
+end
+
+function ReadwiseReader:removeAuthorMetadata(document_id)
+    -- Remove author metadata when document is archived
+    if self.document_authors and self.document_authors[document_id] then
+        self.document_authors[document_id] = nil
+        logger.dbg("ReadwiseReader:removeAuthorMetadata: removed author metadata for document", document_id)
+        self:saveSettings()
+    end
+end
+
+function ReadwiseReader:getDocumentAuthorFromFile(filepath)
+    -- Extract document ID from filepath and get stored author
+    local doc_id = self:getDocumentIdFromPath(filepath)
+    if doc_id then
+        return self:getStoredAuthor(doc_id)
+    end
+    return nil
 end
 
 -- ===============================================================================
@@ -185,12 +236,26 @@ function ReadwiseReader:createHighlights(booknotes)
         ["Authorization"] = "Token " .. self.access_token,
     }
 
+    -- Try to get the correct author from stored metadata
+    local correct_author = nil
+    if booknotes.file then
+        correct_author = self:getDocumentAuthorFromFile(booknotes.file)
+    end
+    
+    -- Fallback to booknotes.author if no stored metadata, but clean it up
+    if not correct_author and booknotes.author and booknotes.author ~= "" then
+        -- Check if the author looks like a filename (contains file extensions)
+        if not booknotes.author:match("%.%w+$") and not booknotes.author:match("[/\\]") then
+            correct_author = booknotes.author:gsub("\n", ", ")
+        end
+    end
+
     for _, chapter in ipairs(booknotes) do
         for _, clipping in ipairs(chapter) do
             local highlight = {
                 text = clipping.text,
                 title = booknotes.title,
-                author = booknotes.author ~= "" and booknotes.author:gsub("\n", ", ") or nil,
+                author = correct_author,
                 source_type = "koreader",
                 category = "books",
                 note = clipping.note,
@@ -243,16 +308,16 @@ end
 
 function ReadwiseReader:addToMainMenu(menu_items)
     menu_items.readwisereader = {
-        text = _("Readwise Reader"),
+        text = "Readwise Reader",
         sub_item_table = {
             {
-                text = _("Sync articles"),
+                text = "Sync articles",
                 callback = function()
                     self.ui:handleEvent(Event:new("SynchronizeReadwiseReader"))
                 end,
             },
             {
-                text = _("Go to download folder"),
+                text = "Go to download folder",
                 callback = function()
                     if self.ui.document then
                         self.ui:onClose()
@@ -268,10 +333,10 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Settings"),
+                text = "Settings",
                 sub_item_table = {
                     {
-                        text = _("Configure Readwise Reader"),
+                        text = "Configure Readwise Reader",
                         keep_menu_open = true,
                         callback = function()
                             self:editSettings()
@@ -281,11 +346,11 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         text_func = function()
                             local path
                             if not self.directory or self.directory == "" then
-                                path = _("Not set")
+                                path = "Not set"
                             else
                                 path = filemanagerutil.abbreviate(self.directory)
                             end
-                            return T(_("Download folder: %1"), BD.dirpath(path))
+                            return string.format("Download folder: %s", BD.dirpath(path))
                         end,
                         keep_menu_open = true,
                         callback = function(touchmenu_instance)
@@ -293,7 +358,7 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                     },
                     {
-                        text = _("Archive finished articles"),
+                        text = "Archive finished articles",
                         checked_func = function() 
                             return self.archive_finished 
                         end,
@@ -303,7 +368,7 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                     },
                     {
-                        text = _("Export highlights at each sync"),
+                        text = "Export highlights at each sync",
                         checked_func = function() 
                             return self.export_highlights_at_sync 
                         end,
@@ -313,7 +378,7 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                     },
                     {
-                        text = _("Exclude from sync"),
+                        text = "Exclude from sync",
                         sub_item_table_func = function()
                             return self:getExclusionMenuItems()
                         end,
@@ -332,12 +397,12 @@ function ReadwiseReader:getExclusionMenuItems()
     local menu_items = {}
     
     table.insert(menu_items, {
-        text = _("Exclude documents of these types or tags:"),
+        text = "Exclude documents of these types or tags:",
     })
     
     if #self.available_locations > 0 then
         table.insert(menu_items, {
-            text = _("--- Locations ---"),
+            text = "--- Locations ---",
             enabled = false,
         })
         
@@ -370,7 +435,7 @@ function ReadwiseReader:getExclusionMenuItems()
     
     if #category_tags > 0 then
         table.insert(menu_items, {
-            text = _("--- Types ---"),
+            text = "--- Types ---",
             enabled = false,
         })
         
@@ -391,7 +456,7 @@ function ReadwiseReader:getExclusionMenuItems()
     
     if #regular_tags > 0 then
         table.insert(menu_items, {
-            text = _("--- Tags ---"),
+            text = "--- Tags ---",
             enabled = false,
         })
         
@@ -412,11 +477,11 @@ function ReadwiseReader:getExclusionMenuItems()
     
     if #self.available_tags == 0 and #self.available_locations == 0 then
         table.insert(menu_items, {
-            text = _("No tags or locations found"),
+            text = "No tags or locations found",
             enabled = false,
         })
         table.insert(menu_items, {
-            text = _("Sync articles first to discover options"),
+            text = "Sync articles first to discover options",
             enabled = false,
         })
     end
@@ -476,7 +541,7 @@ function ReadwiseReader:deleteArticlesWithLocation(location)
     
     if deleted_count > 0 then
         UIManager:show(InfoMessage:new{
-            text = T(_("Deleted %1 articles from location '%2'"), deleted_count, location)
+            text = string.format("Deleted %d articles from location '%s'", deleted_count, location)
         })
         
         if FileManager.instance then
@@ -544,7 +609,7 @@ function ReadwiseReader:deleteArticlesWithTag(tag)
     
     if deleted_count > 0 then
         UIManager:show(InfoMessage:new{
-            text = T(_("Deleted %1 articles with tag '%2'"), deleted_count, tag)
+            text = string.format("Deleted %d articles with tag '%s'", deleted_count, tag)
         })
         
         if FileManager.instance then
@@ -725,12 +790,12 @@ function ReadwiseReader:validateSettings()
     
     if token_empty or directory_empty then
         UIManager:show(MultiConfirmBox:new{
-            text = _("Please configure your Readwise Reader access token and download folder."),
+            text = "Please configure your Readwise Reader access token and download folder.",
             choice1_text_func = function()
                 if token_empty then
-                    return _("Token (★)")
+                    return "Token (★)"
                 else
-                    return _("Token")
+                    return "Token"
                 end
             end,
             choice1_callback = function() 
@@ -738,9 +803,9 @@ function ReadwiseReader:validateSettings()
             end,
             choice2_text_func = function()
                 if directory_empty then
-                    return _("Folder (★)")
+                    return "Folder (★)"
                 else
-                    return _("Folder")
+                    return "Folder"
                 end
             end,
             choice2_callback = function() 
@@ -753,7 +818,7 @@ function ReadwiseReader:validateSettings()
     local dir_mode = lfs.attributes(self.directory, "mode")
     if dir_mode ~= "directory" then
         UIManager:show(InfoMessage:new{
-            text = _("The download folder is not valid.\nPlease configure it in the settings.")
+            text = "The download folder is not valid.\nPlease configure it in the settings."
         })
         return false
     end
@@ -768,21 +833,21 @@ end
 
 function ReadwiseReader:editSettings()
     self.settings_dialog = InputDialog:new {
-        title = _("Readwise Reader settings"),
+        title = "Readwise Reader settings",
         input = self.access_token or "",
-        input_hint = _("Access Token"),
-        description = _("Enter your Readwise Reader access token.\nYou can get it from: https://readwise.io/access_token"),
+        input_hint = "Access Token",
+        description = "Enter your Readwise Reader access token.\nYou can get it from: https://readwise.io/access_token",
         buttons = {
             {
                 {
-                    text = _("Cancel"),
+                    text = "Cancel",
                     id = "close",
                     callback = function()
                         UIManager:close(self.settings_dialog)
                     end
                 },
                 {
-                    text = _("Save"),
+                    text = "Save",
                     callback = function()
                         self.access_token = self.settings_dialog:getInputText()
                         self:saveSettings()
@@ -838,7 +903,7 @@ function ReadwiseReader:callAPI(method, endpoint, body, quiet)
     if resp_headers == nil then
         logger.err("ReadwiseReader:callAPI: network error", status or code)
         if not quiet then
-            UIManager:show(InfoMessage:new{ text = _("Network error connecting to Readwise Reader.") })
+            UIManager:show(InfoMessage:new{ text = "Network error connecting to Readwise Reader." })
         end
         return nil, "network_error"
     end
@@ -860,7 +925,7 @@ function ReadwiseReader:callAPI(method, endpoint, body, quiet)
         logger.err("ReadwiseReader:callAPI: HTTP error", code, status)
         if not quiet then
             UIManager:show(InfoMessage:new{ 
-                text = T(_("Error connecting to Readwise Reader: %1"), code) 
+                text = string.format("Error connecting to Readwise Reader: %s", code) 
             })
         end
         return nil, "http_error", code
@@ -970,7 +1035,7 @@ function ReadwiseReader:cleanupArchivedDocuments()
         return 0
     end
     
-    self:showProgress(_("Checking for archived articles…"))
+    self:showProgress("Checking for archived articles…")
     
     local archived_docs = self:getArchivedDocuments(self.last_sync_time)
     
@@ -987,6 +1052,8 @@ function ReadwiseReader:cleanupArchivedDocuments()
         if local_filepath then
             logger.dbg("ReadwiseReader:cleanupArchivedDocuments: deleting locally archived document", doc.id, local_filepath)
             FileManager:deleteFile(local_filepath, true)
+            -- Remove author metadata for archived documents
+            self:removeAuthorMetadata(doc.id)
             deleted_count = deleted_count + 1
         end
     end
@@ -1018,7 +1085,10 @@ function ReadwiseReader:downloadDocument(document)
         return "skipped"
     end
     
-    self:showProgress(T(_("Processing: %1"), document.title or "Untitled"))
+    self:showProgress(string.format("Processing: %s", document.title or "Untitled"))
+    
+    -- Store author metadata from the API
+    self:storeAuthorMetadata(document.id, document.author)
     
     local content = document.html_content
     
@@ -1117,7 +1187,6 @@ function ReadwiseReader:processHtmlContent(content, document)
 <body>
     <h1>%s</h1>
     <p><em>%s</em></p>
-    <p>Source: <a href="%s">%s</a></p>
     <hr>
     %s
 </body>
@@ -1126,8 +1195,6 @@ function ReadwiseReader:processHtmlContent(content, document)
     document.title or "Untitled",
     document.title or "Untitled", 
     document.author or "Unknown author",
-    document.source_url or "",
-    document.source_url or "",
     decoded_content)
     
     -- Enhanced image processing with size limits
@@ -1303,6 +1370,8 @@ function ReadwiseReader:archiveDocument(document_id)
     
     if result then
         logger.dbg("ReadwiseReader:archiveDocument: successfully archived", document_id)
+        -- Remove author metadata when document is archived
+        self:removeAuthorMetadata(document_id)
         return true
     else
         logger.err("ReadwiseReader:archiveDocument: failed to archive", document_id, err)
@@ -1362,7 +1431,7 @@ function ReadwiseReader:processFinishedDocuments()
 end
 
 function ReadwiseReader:synchronize()
-    local info = InfoMessage:new{ text = _("Connecting to Readwise Reader…") }
+    local info = InfoMessage:new{ text = "Connecting to Readwise Reader…" }
     UIManager:show(info)
     
     if not self:validateSettings() then
@@ -1377,7 +1446,7 @@ function ReadwiseReader:synchronize()
     -- Export highlights if enabled
     local highlights_exported = 0
     if self.export_highlights_at_sync then
-        self:showProgress(_("Exporting highlights to Readwise..."))
+        self:showProgress("Exporting highlights to Readwise...")
         local clippings = self:parseAllBooks()
         if next(clippings) ~= nil then
             highlights_exported, _ = self:exportToReadwise(clippings)
@@ -1388,16 +1457,16 @@ function ReadwiseReader:synchronize()
     local cleaned_count = self:cleanupArchivedDocuments()
     self:hideProgress()
     
-    self:showProgress(_("Processing finished articles…"))
+    self:showProgress("Processing finished articles…")
     local archived_count, deleted_count = self:processFinishedDocuments()
     self:hideProgress()
     
-    self:showProgress(_("Getting document list…"))
+    self:showProgress("Getting document list…")
     local documents = self:getDocumentList()
     self:hideProgress()
     
     if not documents then
-        UIManager:show(InfoMessage:new{ text = _("Failed to get document list from Readwise Reader.") })
+        UIManager:show(InfoMessage:new{ text = "Failed to get document list from Readwise Reader." })
         return
     end
     
@@ -1418,12 +1487,12 @@ function ReadwiseReader:synchronize()
     end
     
     if #filtered_documents == 0 and cleaned_count == 0 and archived_count == 0 and highlights_exported == 0 then
-        local msg = _("No new articles found and no changes to process.")
+        local msg = "No new articles found and no changes to process."
         if existing_count > 0 then
-            msg = msg .. "\n" .. T(_("Skipped %1 existing articles."), existing_count)
+            msg = msg .. "\n" .. string.format("Skipped %d existing articles.", existing_count)
         end
         if excluded_count > 0 then
-            msg = msg .. "\n" .. T(_("Excluded %1 articles due to tags/locations."), excluded_count)
+            msg = msg .. "\n" .. string.format("Excluded %d articles due to tags/locations.", excluded_count)
         end
         UIManager:show(InfoMessage:new{ text = msg })
         
@@ -1437,7 +1506,7 @@ function ReadwiseReader:synchronize()
     local failed = 0
     
     for i, document in ipairs(filtered_documents) do
-        self:showProgress(T(_("Downloading %1 of %2…"), i, #filtered_documents))
+        self:showProgress(string.format("Downloading %d of %d…", i, #filtered_documents))
         
         local result = self:downloadDocument(document)
         
@@ -1455,43 +1524,43 @@ function ReadwiseReader:synchronize()
     self.last_sync_time = sync_start_time
     self:saveSettings()
     
-    local msg = _("Sync complete:")
+    local msg = "Sync complete:"
     
     if highlights_exported > 0 then
-        msg = msg .. "\n" .. T(_("Exported highlights: %1 books"), highlights_exported)
+        msg = msg .. "\n" .. string.format("Exported highlights: %d books", highlights_exported)
     end
     
     if downloaded > 0 then
-        msg = msg .. "\n" .. T(_("Downloaded: %1"), downloaded)
+        msg = msg .. "\n" .. string.format("Downloaded: %d", downloaded)
     end
     
     if existing_count > 0 then
-        msg = msg .. "\n" .. T(_("Skipped (already exists): %1"), existing_count)
+        msg = msg .. "\n" .. string.format("Skipped (already exists): %d", existing_count)
     end
     
     if skipped > 0 then
-        msg = msg .. "\n" .. T(_("Skipped (other): %1"), skipped)
+        msg = msg .. "\n" .. string.format("Skipped (other): %d", skipped)
     end
     
     if failed > 0 then
-        msg = msg .. "\n" .. T(_("Failed: %1"), failed)
+        msg = msg .. "\n" .. string.format("Failed: %d", failed)
     end
     
     if excluded_count > 0 then
-        msg = msg .. "\n" .. T(_("Excluded due to tags/locations: %1"), excluded_count)
+        msg = msg .. "\n" .. string.format("Excluded due to tags/locations: %d", excluded_count)
     end
     
     if cleaned_count > 0 then
-        msg = msg .. "\n" .. T(_("Cleaned up archived: %1"), cleaned_count)
+        msg = msg .. "\n" .. string.format("Cleaned up archived: %d", cleaned_count)
     end
     
     if archived_count > 0 then
-        msg = msg .. "\n" .. T(_("Archived in Readwise: %1"), archived_count)
-        msg = msg .. "\n" .. T(_("Deleted locally: %1"), deleted_count)
+        msg = msg .. "\n" .. string.format("Archived in Readwise: %d", archived_count)
+        msg = msg .. "\n" .. string.format("Deleted locally: %d", deleted_count)
     end
     
     if downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and excluded_count == 0 and existing_count == 0 and highlights_exported == 0 then
-        msg = msg .. "\n" .. _("No changes to process.")
+        msg = msg .. "\n" .. "No changes to process."
     end
     
     UIManager:show(InfoMessage:new{ text = msg })
@@ -1522,6 +1591,7 @@ function ReadwiseReader:saveSettings()
         available_locations = self.available_locations,
         excluded_locations = self.excluded_locations,
         document_locations = self.document_locations,
+        document_authors = self.document_authors,
     }
     self.readwise_settings:saveSetting("readwisereader", settings)
     self.readwise_settings:flush()
