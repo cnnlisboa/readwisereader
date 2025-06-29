@@ -11,7 +11,6 @@ A simple plugin for KOReader integration with Readwise’s highlight saving and 
 
 ## Limitations and Known Issues:
 - Unfortunately two way highlight syncing is not possible as the Readwise Reader API does not provide the location data required by KOReader.
-- Readwise Reader’s Highlight Tags are not supported as there is no equivalent in KOReader.
 - Very image heavy files will download, but may cause KOReader to crash if the file is large. I am looking at ways to negate this.
 
 ## Installation:
