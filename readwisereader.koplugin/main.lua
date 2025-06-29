@@ -391,7 +391,7 @@ function ReadwiseReader:addToMainMenu(menu_items)
 end
 
 -- ===============================================================================
--- READER SYNC FUNCTIONALITY (ORIGINAL PLUGIN CODE)
+-- READER SYNC FUNCTIONALITY 
 -- ===============================================================================
 
 function ReadwiseReader:getExclusionMenuItems()
@@ -408,15 +408,44 @@ function ReadwiseReader:getExclusionMenuItems()
         })
         
         for _, location in ipairs(self.available_locations) do
-            local display_location = location:sub(1,1):upper() .. location:sub(2)
+            local display_location
+            if location == "new" then
+                display_location = "Inbox"
+            else
+                display_location = location:sub(1,1):upper() .. location:sub(2)
+            end
             
             table.insert(menu_items, {
                 text = display_location,
                 checked_func = function()
-                    return self:isLocationExcluded(location)
+                    -- Check if location is in excluded list
+                    for _, excluded_location in ipairs(self.excluded_locations) do
+                        if excluded_location == location then
+                            return true
+                        end
+                    end
+                    return false
                 end,
                 callback = function()
-                    self:toggleLocationExclusion(location)
+                    -- Toggle location exclusion
+                    local found_index = nil
+                    for i, excluded_location in ipairs(self.excluded_locations) do
+                        if excluded_location == location then
+                            found_index = i
+                            break
+                        end
+                    end
+                    
+                    if found_index then
+                        table.remove(self.excluded_locations, found_index)
+                        logger.dbg("ReadwiseReader:toggleLocationExclusion: removed location from exclusion:", location)
+                    else
+                        table.insert(self.excluded_locations, location)
+                        logger.dbg("ReadwiseReader:toggleLocationExclusion: added location to exclusion:", location)
+                        self:deleteArticlesWithLocation(location)
+                    end
+                    
+                    self:saveSettings()
                 end,
             })
         end
@@ -488,15 +517,6 @@ function ReadwiseReader:getExclusionMenuItems()
     end
     
     return menu_items
-end
-
-function ReadwiseReader:isLocationExcluded(location)
-    for _, excluded_location in ipairs(self.excluded_locations) do
-        if excluded_location == location then
-            return true
-        end
-    end
-    return false
 end
 
 function ReadwiseReader:toggleLocationExclusion(location)
@@ -937,7 +957,7 @@ function ReadwiseReader:getDocumentList()
     local documents = {}
     local next_cursor = nil
     
-    local locations = {"later", "shortlist"}
+    local locations = {"new", "later", "shortlist"}
     
     for _, location in ipairs(locations) do
         logger.dbg("ReadwiseReader:getDocumentList: fetching documents from location:", location)
