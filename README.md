@@ -1,8 +1,8 @@
 # A KOReader plugin for Readwise and Readwise Reader
-A simple plugin for KOReader integration with Readwise’s highlight saving and read later services (Readwise Reader). A Readwise subscription is required. 
+A simple plugin for KOReader integration with the highlight saving and read later services Readwise and Readwise Reader. A Readwise subscription is required. 
 
 ## Key features:
-- Articles in Readwise Reader saved to “Later” or “Shortlist” are downloaded to KOReader as HTML files.
+- Articles in Readwise Reader saved to “Inbox”, “Later” or “Shortlist” are downloaded to KOReader as HTML files.
 - Images are downloaded where this is possible.
 - Articles which have been read in KOReader and marked as “finished” will be moved to the Readwise Reader Archive at the next sync, and deleted from KOReader.
 - At sync, articles which have been archived in Readwise Reader will be deleted from KOReader.
@@ -11,7 +11,7 @@ A simple plugin for KOReader integration with Readwise’s highlight saving and 
 
 ## Limitations and Known Issues:
 - Unfortunately two way highlight syncing is not possible as the Readwise Reader API does not provide the location data required by KOReader.
-- Very image heavy files will download, but may cause KOReader to crash if the file is large. I am looking at ways to negate this.
+- Very image heavy files will download, but may cause KOReader to crash if the file is large. Due to the way images are saved and the limitations of HTML files, this is more of an issue that with EPUBs I am looking at ways to negate this.
 
 ## Installation:
 - Download the ZIP file of the plugin [here](https://github.com/tomtom800/readwisereader/archive/refs/heads/main.zip). Extract it.
