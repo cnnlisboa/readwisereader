@@ -258,7 +258,7 @@ function ReadwiseReader:createHighlights(booknotes)
                 title = booknotes.title,
                 author = correct_author,
                 source_type = "koreader",
-                category = "books",
+                category = "articles",  -- Changed from "books" to "articles"
                 note = clipping.note,
                 location = clipping.page,
                 location_type = "order",
