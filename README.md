@@ -11,7 +11,7 @@ A simple plugin for KOReader integration with the highlight saving and read late
 
 ## Limitations and Known Issues:
 - Unfortunately two way highlight syncing is not possible as the Readwise Reader API does not provide the location data required by KOReader.
-- Very image heavy files will download, but may cause KOReader to crash if the file is large. Due to the way images are saved and the limitations of HTML files, this is more of an issue that with EPUBs I am looking at ways to negate this.
+- Very image heavy files will download, but may cause KOReader to crash if the file is large. Due to the way images are saved and the limitations of HTML files, this is more of an issue that with EPUBs. I am looking at ways to negate this.
 
 ## Installation:
 - Download the ZIP file of the plugin [here](https://github.com/tomtom800/readwisereader/archive/refs/heads/main.zip). Extract it.
