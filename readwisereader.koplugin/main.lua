@@ -12,6 +12,7 @@
 -- - Exports highlights and notes to Readwise
 -- - Handles incremental sync with cleanup of archived content
 -- - Fixed author metadata handling for proper highlight export
+-- - Enhanced URL corruption detection and repair for all image sources
 -- ===============================================================================
 
 local BD = require("ui/bidi")
@@ -1138,6 +1139,7 @@ function ReadwiseReader:downloadDocument(document)
 end
 
 function ReadwiseReader:processHtmlContent(content, document)
+    -- First decode HTML entities
     local decoded_content = content:gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"')
     
     -- Enhanced image processing - extract larger images from responsive picture elements
@@ -1197,23 +1199,144 @@ function ReadwiseReader:processHtmlContent(content, document)
     document.author or "Unknown author",
     decoded_content)
     
-    -- Enhanced image processing with size limits
+    -- Enhanced image processing with general URL corruption fix
     local processed_html = html:gsub('(<img[^>]+src=")([^"]+)(")', function(prefix, url, suffix)
         if url:match("^data:") then
             return prefix .. url .. suffix
         elseif url:match("^https?://") then
-            local encoded = self:fetchAndEncodeImage(url)
+            local clean_url = self:fixCorruptedUrl(url)
+            local encoded = self:fetchAndEncodeImage(clean_url)
             if encoded then
                 return prefix .. encoded .. suffix
             else
                 local alt_text = html:match('alt="([^"]*)"') or "Image"
-                return string.format('<div class="image-placeholder">📷 Image: %s<br><small>Source: %s</small></div>', alt_text, url)
+                return string.format('<div class="image-placeholder">📷 Image: %s<br><small>Source: %s</small></div>', alt_text, clean_url)
             end
         end
         return prefix .. url .. suffix
     end)
     
+    -- Also process images in href attributes (which often contain higher resolution versions)
+    processed_html = processed_html:gsub('(<a[^>]+href=")([^"]+)("[^>]*><img[^>]+src=")([^"]+)(")', function(link_prefix, href_url, middle, img_url, img_suffix)
+        if href_url:match("^https?://") then
+            -- Try the href URL first (often higher quality)
+            local clean_href_url = self:fixCorruptedUrl(href_url)
+            local encoded = self:fetchAndEncodeImage(clean_href_url)
+            if encoded then
+                -- Replace both the href and src with the encoded image
+                return link_prefix .. "#" .. middle .. encoded .. img_suffix
+            else
+                -- Fall back to trying the img src
+                local clean_img_url = self:fixCorruptedUrl(img_url)
+                local img_encoded = self:fetchAndEncodeImage(clean_img_url)
+                if img_encoded then
+                    return link_prefix .. "#" .. middle .. img_encoded .. img_suffix
+                else
+                    local alt_text = middle:match('alt="([^"]*)"') or "Image"
+                    return string.format('<div class="image-placeholder">📷 Image: %s<br><small>Source: %s</small></div>', alt_text, clean_href_url)
+                end
+            end
+        end
+        -- For non-HTTP URLs, process img src normally
+        if img_url:match("^https?://") then
+            local clean_img_url = self:fixCorruptedUrl(img_url)
+            local encoded = self:fetchAndEncodeImage(clean_img_url)
+            if encoded then
+                return link_prefix .. href_url .. middle .. encoded .. img_suffix
+            end
+        end
+        return link_prefix .. href_url .. middle .. img_url .. img_suffix
+    end)
+    
     return processed_html
+end
+
+-- General function to fix corrupted URLs
+function ReadwiseReader:fixCorruptedUrl(url)
+    local clean_url = url
+    
+    -- Fix common URL encoding corruptions that occur during HTML processing
+    local url_fixes = {
+        ["%%24"] = "$",   -- Dollar sign
+        ["%%21"] = "!",   -- Exclamation mark
+        ["%%2C"] = ",",   -- Comma
+        ["%%2c"] = ",",   -- Comma (lowercase)
+        ["%%3A"] = ":",   -- Colon
+        ["%%3a"] = ":",   -- Colon (lowercase)
+        ["%%2F"] = "/",   -- Forward slash
+        ["%%2f"] = "/",   -- Forward slash (lowercase)
+        ["%%3F"] = "?",   -- Question mark
+        ["%%3f"] = "?",   -- Question mark (lowercase)
+        ["%%3D"] = "=",   -- Equals sign
+        ["%%3d"] = "=",   -- Equals sign (lowercase)
+        ["%%26"] = "&",   -- Ampersand
+        ["%%28"] = "(",   -- Opening parenthesis
+        ["%%29"] = ")",   -- Closing parenthesis
+        ["%%5B"] = "[",   -- Opening bracket
+        ["%%5b"] = "[",   -- Opening bracket (lowercase)
+        ["%%5D"] = "]",   -- Closing bracket
+        ["%%5d"] = "]",   -- Closing bracket (lowercase)
+        ["%%7B"] = "{",   -- Opening brace
+        ["%%7b"] = "{",   -- Opening brace (lowercase)
+        ["%%7D"] = "}",   -- Closing brace
+        ["%%7d"] = "}",   -- Closing brace (lowercase)
+        ["%%20"] = "%%20", -- Keep spaces encoded (don't fix these)
+        ["%%2B"] = "+",   -- Plus sign
+        ["%%2b"] = "+",   -- Plus sign (lowercase)
+        ["%%23"] = "#",   -- Hash/pound sign
+        ["%%25"] = "%%",  -- Percent sign (double-encoded)
+        ["%%40"] = "@",   -- At sign
+        ["%%5C"] = "\\",  -- Backslash
+        ["%%5c"] = "\\",  -- Backslash (lowercase)
+        ["%%7C"] = "|",   -- Pipe
+        ["%%7c"] = "|",   -- Pipe (lowercase)
+        ["%%5E"] = "^",   -- Caret
+        ["%%5e"] = "^",   -- Caret (lowercase)
+        ["%%60"] = "`",   -- Backtick
+        ["%%7E"] = "~",   -- Tilde
+        ["%%7e"] = "~",   -- Tilde (lowercase)
+    }
+    
+    -- Apply all the fixes
+    for encoded, decoded in pairs(url_fixes) do
+        clean_url = clean_url:gsub(encoded, decoded)
+    end
+    
+    -- Remove any trailing fragments that might cause issues
+    clean_url = clean_url:gsub("#.*$", "")
+    
+    -- Fix any double-encoding issues (e.g., %2525 -> %25 -> %)
+    -- Do this in a loop until no more changes occur
+    local previous_url
+    repeat
+        previous_url = clean_url
+        clean_url = clean_url:gsub("%%%%25", "%%")
+    until clean_url == previous_url
+    
+    -- Fix malformed URLs that might have incomplete encoding
+    -- Look for patterns like "fl_progressive:steep/https" which suggest URL corruption
+    if clean_url:match("[^/]https%%3A%%2F%%2F") then
+        -- Find the start of the embedded URL
+        local embedded_start = clean_url:find("https%%3A%%2F%%2F")
+        if embedded_start then
+            -- Extract and decode the embedded URL
+            local embedded_url = clean_url:sub(embedded_start)
+            embedded_url = embedded_url:gsub("%%3A", ":"):gsub("%%2F", "/")
+            
+            -- Check if this looks like a complete URL
+            if embedded_url:match("^https://[^/]+/") then
+                clean_url = embedded_url
+                logger.dbg("ReadwiseReader:fixCorruptedUrl: extracted embedded URL:", clean_url)
+            end
+        end
+    end
+    
+    -- Log the transformation if it changed
+    if clean_url ~= url then
+        logger.dbg("ReadwiseReader:fixCorruptedUrl: fixed", url, "to", clean_url)
+    end
+    
+    return clean_url
 end
 
 -- Enhanced responsive image extraction
