@@ -1444,6 +1444,12 @@ end
 function ReadwiseReader:fetchAndEncodeImage(url)
     logger.dbg("ReadwiseReader:fetchAndEncodeImage: attempting to fetch", url)
     
+    -- Handle data: URLs - they're already encoded, just return them as-is
+    if url:match("^data:") then
+        logger.dbg("ReadwiseReader:fetchAndEncodeImage: data URL detected, returning as-is")
+        return url
+    end
+    
     local response = {}
     local request = {
         url = url,
