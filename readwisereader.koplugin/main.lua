@@ -103,7 +103,7 @@ function ReadwiseReader:init()
     self.needs_rate_limiting = false
 
     -- Initialize highlights parser
-    self.parser = MyClipping:new{}
+    self.parser = MyClipping:new{ ui = self.ui }
     
     self.ui.menu:registerToMainMenu(self)
 end
@@ -469,6 +469,10 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                     },
                 }
+            },
+            {
+                text = "Version 1.5",
+                enabled = false,
             },
         },
     }
