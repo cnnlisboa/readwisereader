@@ -1779,9 +1779,17 @@ function ReadwiseReader:synchronize()
     local highlights_exported = 0
     if self.export_highlights_at_sync then
         self:showProgress("Exporting highlights to Readwise...")
-        local clippings = self:parseAllBooks()
-        if next(clippings) ~= nil then
-            highlights_exported, _ = self:exportToReadwise(clippings)
+        local success, clippings = pcall(function() return self:parseAllBooks() end)
+        if success then
+            if next(clippings) ~= nil then
+                highlights_exported, _ = self:exportToReadwise(clippings)
+            end
+        else
+            logger.warn("ReadwiseReader:synchronize: error parsing books for highlights:", clippings)
+            UIManager:show(InfoMessage:new{
+                text = "Note: Highlight export failed, but continuing with article sync.",
+                timeout = 3
+            })
         end
         self:hideProgress()
     end
