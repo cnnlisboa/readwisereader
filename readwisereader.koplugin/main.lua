@@ -8,7 +8,7 @@
 -- - Downloads articles from Readwise Reader "later" and "shortlist" locations
 -- - Converts articles to HTML format with embedded images
 -- - Generates KOReader metadata sidecars (.sdr) for enhanced library integration
--- - Offers filtering by article tags, location and type
+-- - Offers filtering by article tags, location, type and site name (via series)
 -- - Archives finished articles back to Readwise
 -- - Exports highlights and notes to Readwise
 -- - Handles incremental sync with cleanup of archived content
@@ -238,6 +238,10 @@ function ReadwiseReader:setDocumentMetadata(filepath, document)
 
     if document.summary and document.summary ~= "" then
         props.description = document.summary
+    end
+
+    if document.site_name and document.site_name ~= "" then
+        props.series = document.site_name
     end
 
     -- Both doc_props and custom_props need to exist, otherwise KOReader will crash
