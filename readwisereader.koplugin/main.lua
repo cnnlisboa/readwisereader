@@ -101,6 +101,9 @@ function ReadwiseReader:init()
     -- Initialize max articles download limit
     self.max_articles_to_download = settings.max_articles_to_download or 0 -- 0 = unlimited
 
+    -- Initialize koreader tag filter (only sync articles tagged "koreader")
+    self.sync_only_koreader_tag = settings.sync_only_koreader_tag or false
+
     -- Simple rate limiting state
     self.api_call_count = 0
     self.sync_start_time = nil
@@ -480,6 +483,16 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                     },
                     {
+                        text = "Only sync articles tagged 'koreader'",
+                        checked_func = function()
+                            return self.sync_only_koreader_tag
+                        end,
+                        callback = function()
+                            self.sync_only_koreader_tag = not self.sync_only_koreader_tag
+                            self:saveSettings()
+                        end,
+                    },
+                    {
                         text = "Exclude from sync",
                         sub_item_table_func = function()
                             return self:getExclusionMenuItems()
@@ -488,7 +501,7 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 }
             },
             {
-                text = "Version 1.7",
+                text = "Version 2.0 beta",
                 enabled = false,
             },
         },
@@ -1144,6 +1157,9 @@ function ReadwiseReader:getDocumentList()
 
                 -- Fetch with HTML content and tags for batch processing
                 local endpoint = "/list/?location=" .. location .. "&withHtmlContent=true&withTags=true"
+                if self.sync_only_koreader_tag then
+                    endpoint = endpoint .. "&tag=koreader"
+                end
                 if next_cursor and type(next_cursor) == "string" and next_cursor ~= "" then
                     endpoint = endpoint .. "&pageCursor=" .. next_cursor
                 end
@@ -1271,6 +1287,40 @@ function ReadwiseReader:cleanupArchivedDocuments()
     
     logger.dbg("ReadwiseReader:cleanupArchivedDocuments: deleted", deleted_count, "locally archived documents")
     return deleted_count
+end
+
+function ReadwiseReader:reconcileLocalDocuments(server_documents)
+    -- Remove local articles that no longer exist on server or no longer match filters
+    self:showProgress("Checking for removed articles…")
+
+    -- Build a set of document IDs that should exist locally
+    local server_ids = {}
+    for _, doc in ipairs(server_documents) do
+        server_ids[doc.id] = true
+    end
+
+    local removed_count = 0
+
+    -- Scan local directory for Readwise articles
+    for entry in lfs.dir(self.directory) do
+        if entry ~= "." and entry ~= ".." then
+            local filepath = self.directory .. entry
+
+            if lfs.attributes(filepath, "mode") == "file" and entry:find(article_id_prefix, 1, true) then
+                local doc_id = self:getDocumentIdFromPath(filepath)
+
+                if doc_id and not server_ids[doc_id] then
+                    logger.dbg("ReadwiseReader:reconcileLocalDocuments: removing", filepath, "- no longer matches server state")
+                    FileManager:deleteFile(filepath, true)
+                    self:removeAuthorMetadata(doc_id)
+                    removed_count = removed_count + 1
+                end
+            end
+        end
+    end
+
+    logger.dbg("ReadwiseReader:reconcileLocalDocuments: removed", removed_count, "articles no longer on server")
+    return removed_count
 end
 
 function ReadwiseReader:documentExists(doc_id)
@@ -1870,6 +1920,10 @@ function ReadwiseReader:synchronize()
     
     self:updateAvailableTags(documents)
 
+    -- Remove local articles that no longer match server state
+    local reconciled_count = self:reconcileLocalDocuments(documents)
+    self:hideProgress()
+
     local filtered_documents = {}
     local existing_count = 0
 
@@ -1881,7 +1935,7 @@ function ReadwiseReader:synchronize()
         end
     end
 
-    if #filtered_documents == 0 and cleaned_count == 0 and archived_count == 0 and highlights_exported == 0 then
+    if #filtered_documents == 0 and cleaned_count == 0 and archived_count == 0 and highlights_exported == 0 and reconciled_count == 0 then
         local msg = "No new articles found and no changes to process."
         if existing_count > 0 then
             msg = msg .. "\n" .. string.format("Skipped %d existing articles.", existing_count)
@@ -1941,7 +1995,11 @@ function ReadwiseReader:synchronize()
     if cleaned_count > 0 then
         msg = msg .. "\n" .. string.format("Cleaned up archived: %d", cleaned_count)
     end
-    
+
+    if reconciled_count > 0 then
+        msg = msg .. "\n" .. string.format("Removed (no longer on server): %d", reconciled_count)
+    end
+
     if archived_count > 0 then
         msg = msg .. "\n" .. string.format("Archived in Readwise: %d", archived_count)
         msg = msg .. "\n" .. string.format("Deleted locally: %d", deleted_count)
@@ -1983,6 +2041,7 @@ function ReadwiseReader:saveSettings()
         download_images = self.download_images,
         max_image_size_mb = self.max_image_size_mb,
         max_articles_to_download = self.max_articles_to_download,
+        sync_only_koreader_tag = self.sync_only_koreader_tag,
     }
     self.readwise_settings:saveSetting("readwisereader", settings)
     self.readwise_settings:flush()
