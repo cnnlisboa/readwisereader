@@ -648,22 +648,13 @@ end
 function ReadwiseReader:deleteArticlesWithLocation(location)
     local deleted_count = 0
     
-    for entry in lfs.dir(self.directory) do
-        if entry ~= "." and entry ~= ".." then
-            local filepath = self.directory .. entry
-            
-            if lfs.attributes(filepath, "mode") == "file" and entry:find(article_id_prefix, 1, true) then
-                local doc_id = self:getDocumentIdFromPath(filepath)
-                if doc_id then
-                    if self:documentHasLocation(doc_id, location) then
-                        logger.dbg("ReadwiseReader:deleteArticlesWithLocation: deleting", filepath, "with location", location)
-                        FileManager:deleteFile(filepath, true)
-                        deleted_count = deleted_count + 1
-                    end
-                end
-            end
+    self:forEachLocalDocument(function(doc_id, filepath)
+        if self:documentHasLocation(doc_id, location) then
+            logger.dbg("ReadwiseReader:deleteArticlesWithLocation: deleting", filepath, "with location", location)
+            FileManager:deleteFile(filepath, true)
+            deleted_count = deleted_count + 1
         end
-    end
+    end)
     
     if deleted_count > 0 then
         UIManager:show(InfoMessage:new{
@@ -716,22 +707,13 @@ end
 function ReadwiseReader:deleteArticlesWithTag(tag)
     local deleted_count = 0
     
-    for entry in lfs.dir(self.directory) do
-        if entry ~= "." and entry ~= ".." then
-            local filepath = self.directory .. entry
-            
-            if lfs.attributes(filepath, "mode") == "file" and entry:find(article_id_prefix, 1, true) then
-                local doc_id = self:getDocumentIdFromPath(filepath)
-                if doc_id then
-                    if self:documentHasTag(doc_id, tag) then
-                        logger.dbg("ReadwiseReader:deleteArticlesWithTag: deleting", filepath, "with tag", tag)
-                        FileManager:deleteFile(filepath, true)
-                        deleted_count = deleted_count + 1
-                    end
-                end
-            end
+    self:forEachLocalDocument(function(doc_id, filepath)
+        if self:documentHasTag(doc_id, tag) then
+            logger.dbg("ReadwiseReader:deleteArticlesWithTag: deleting", filepath, "with tag", tag)
+            FileManager:deleteFile(filepath, true)
+            deleted_count = deleted_count + 1
         end
-    end
+    end)
     
     if deleted_count > 0 then
         UIManager:show(InfoMessage:new{
@@ -1226,18 +1208,29 @@ function ReadwiseReader:getArchivedDocuments(since_date)
     return documents
 end
 
-function ReadwiseReader:findLocalDocumentByReadwiseId(readwise_id)
-    local filename_pattern = article_id_prefix .. readwise_id .. article_id_postfix
-    
+function ReadwiseReader:forEachLocalDocument(callback)
     for entry in lfs.dir(self.directory) do
-        if entry ~= "." and entry ~= ".." then
-            if entry:find(filename_pattern, 1, true) then
-                return self.directory .. entry
+        if entry:match("%.html$") then
+            local filepath = self.directory .. entry
+            if lfs.attributes(filepath, "mode") == "file" then
+                local doc_id = self:getDocumentIdFromPath(filepath)
+                if doc_id then
+                    local result = callback(doc_id, filepath)
+                    if result ~= nil then
+                        return result
+                    end
+                end
             end
         end
     end
-    
-    return nil
+end
+
+function ReadwiseReader:findLocalDocumentByReadwiseId(readwise_id)
+    return self:forEachLocalDocument(function(doc_id, filepath)
+        if doc_id == readwise_id then
+            return filepath
+        end
+    end)
 end
 
 function ReadwiseReader:cleanupArchivedDocuments()
@@ -1274,15 +1267,7 @@ function ReadwiseReader:cleanupArchivedDocuments()
 end
 
 function ReadwiseReader:documentExists(doc_id)
-    local filename_pattern = article_id_prefix .. doc_id .. article_id_postfix
-    
-    for entry in lfs.dir(self.directory) do
-        if entry:find(filename_pattern, 1, true) then
-            return true
-        end
-    end
-    
-    return false
+    return self:findLocalDocumentByReadwiseId(doc_id) ~= nil
 end
 
 function ReadwiseReader:downloadDocument(document)
@@ -1790,27 +1775,21 @@ function ReadwiseReader:processFinishedDocuments()
     local archived_count = 0
     local deleted_count = 0
     
-    for entry in lfs.dir(self.directory) do
-        if entry ~= "." and entry ~= ".." then
-            local filepath = self.directory .. entry
+    self:forEachLocalDocument(function(doc_id, filepath)
+        if DocSettings:hasSidecarFile(filepath) then
+            local doc_settings = DocSettings:open(filepath)
+            local summary = doc_settings:readSetting("summary")
+            local status = summary and summary.status
             
-            if lfs.attributes(filepath, "mode") == "file" and DocSettings:hasSidecarFile(filepath) then
-                local doc_settings = DocSettings:open(filepath)
-                local summary = doc_settings:readSetting("summary")
-                local status = summary and summary.status
-                
-                if status == "complete" then
-                    local doc_id = self:getDocumentIdFromPath(filepath)
-                    
-                    if doc_id and self:archiveDocument(doc_id) then
-                        archived_count = archived_count + 1
-                        FileManager:deleteFile(filepath, true)
-                        deleted_count = deleted_count + 1
-                    end
+            if status == "complete" then
+                if self:archiveDocument(doc_id) then
+                    archived_count = archived_count + 1
+                    FileManager:deleteFile(filepath, true)
+                    deleted_count = deleted_count + 1
                 end
             end
         end
-    end
+    end)
     
     return archived_count, deleted_count
 end
