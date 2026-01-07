@@ -1346,8 +1346,6 @@ function ReadwiseReader:downloadDocument(document)
         return "skipped"
     end
     
-    self:showProgress(string.format("Processing: %s", document.title or "Untitled"))
-    
     -- Store author metadata from the API
     self:storeAuthorMetadata(document.id, document.author)
 
@@ -1781,6 +1779,9 @@ function ReadwiseReader:fetchAndEncodeImage(url)
 end
 
 function ReadwiseReader:showProgress(text)
+    if self.progress_message then
+        UIManager:close(self.progress_message)
+    end
     self.progress_message = InfoMessage:new{text = text, timeout = 1}
     UIManager:show(self.progress_message)
     UIManager:forceRePaint()
@@ -1903,17 +1904,15 @@ function ReadwiseReader:synchronize()
     end
     
     local cleaned_count = self:cleanupArchivedDocuments()
-    self:hideProgress()
     
     self:showProgress("Processing finished articles…")
     local archived_count, deleted_count = self:processFinishedDocuments()
-    self:hideProgress()
     
     self:showProgress("Getting document list…")
     local documents = self:getDocumentList()
-    self:hideProgress()
     
     if not documents then
+        self:hideProgress()
         UIManager:show(InfoMessage:new{ text = "Failed to get document list from Readwise Reader." })
         return
     end
@@ -1940,6 +1939,8 @@ function ReadwiseReader:synchronize()
         if existing_count > 0 then
             msg = msg .. "\n" .. string.format("Skipped %d existing articles.", existing_count)
         end
+        
+        self:hideProgress()
         UIManager:show(InfoMessage:new{ text = msg })
         
         self.last_sync_time = sync_start_time
@@ -1952,7 +1953,7 @@ function ReadwiseReader:synchronize()
     local failed = 0
     
     for i, document in ipairs(filtered_documents) do
-        self:showProgress(string.format("Downloading %d of %d…", i, #filtered_documents))
+        self:showProgress(string.format("Downloading %d of %d: %s", i, #filtered_documents, document.title))
         
         local result = self:downloadDocument(document)
         
