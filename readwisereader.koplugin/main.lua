@@ -102,6 +102,9 @@ function ReadwiseReader:init()
     -- Initialize max articles download limit
     self.max_articles_to_download = settings.max_articles_to_download or 0 -- 0 = unlimited
 
+    -- Initialize koreader tag filter (only sync articles tagged "koreader")
+    self.sync_only_koreader_tag = settings.sync_only_koreader_tag or false
+
     -- Simple rate limiting state
     self.api_call_count = 0
     self.sync_start_time = nil
@@ -237,12 +240,14 @@ function ReadwiseReader:setDocumentMetadata(filepath, document)
         props.description = document.summary
     end
 
+    -- Both doc_props and custom_props need to exist, otherwise KOReader will crash
     custom_doc_settings:saveSetting("doc_props", props)
     custom_doc_settings:saveSetting("custom_props", props)
 
     local success = custom_doc_settings:flushCustomMetadata(filepath)
 
     if success then
+        -- Broadcast events to ensure metadata is reliably picked up
         UIManager:broadcastEvent(Event:new("InvalidateMetadataCache", filepath))
         UIManager:broadcastEvent(Event:new("BookMetadataChanged"))
         logger.dbg("ReadwiseReader:setDocumentMetadata: wrote custom metadata for", filepath)
@@ -520,6 +525,16 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                     },
                     {
+                        text = "Only sync articles tagged 'koreader'",
+                        checked_func = function()
+                            return self.sync_only_koreader_tag
+                        end,
+                        callback = function()
+                            self.sync_only_koreader_tag = not self.sync_only_koreader_tag
+                            self:saveSettings()
+                        end,
+                    },
+                    {
                         text = "Exclude from sync",
                         sub_item_table_func = function()
                             return self:getExclusionMenuItems()
@@ -528,7 +543,7 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 }
             },
             {
-                text = "Version 1.7",
+                text = "Version 2.3 beta",
                 enabled = false,
             },
         },
@@ -1087,11 +1102,38 @@ function ReadwiseReader:callAPI(method, endpoint, body, quiet)
     
     -- Apply rate limiting before making the call
     self:checkRateLimit()
-    
-    socketutil:set_timeout(10, 60)
-    local code, resp_headers, status = socket.skip(1, http.request(request))
-    socketutil:reset_timeout()
-    
+
+    -- Retry logic for HTTPS/wantread errors (common on Kindle devices)
+    local max_retries = 3
+    local retry_delay = 2  -- seconds
+    local code, resp_headers, status
+
+    for attempt = 1, max_retries do
+        socketutil:set_timeout(10, 60)
+        code, resp_headers, status = socket.skip(1, http.request(request))
+        socketutil:reset_timeout()
+
+        -- If we got a response, break out of retry loop
+        if resp_headers ~= nil then
+            break
+        end
+
+        -- Check if it's a wantread error (HTTPS issue on Kindle)
+        local error_msg = tostring(status or code or "")
+        if error_msg:match("wantread") and attempt < max_retries then
+            logger.dbg("ReadwiseReader:callAPI: wantread error, retrying", attempt, "of", max_retries)
+            socket.sleep(retry_delay)
+            -- Recreate sink for retry
+            sink = {}
+            request.sink = ltn12.sink.table(sink)
+            if body then
+                request.source = ltn12.source.string(json_body)
+            end
+        else
+            break
+        end
+    end
+
     if resp_headers == nil then
         logger.err("ReadwiseReader:callAPI: network error", status or code)
         if not quiet then
@@ -1166,6 +1208,9 @@ function ReadwiseReader:getDocumentList()
 
                 -- Fetch with HTML content and tags for batch processing
                 local endpoint = "/list/?location=" .. location .. "&withHtmlContent=true&withTags=true"
+                if self.sync_only_koreader_tag then
+                    endpoint = endpoint .. "&tag=koreader"
+                end
                 if next_cursor and type(next_cursor) == "string" and next_cursor ~= "" then
                     endpoint = endpoint .. "&pageCursor=" .. next_cursor
                 end
@@ -1306,6 +1351,32 @@ function ReadwiseReader:cleanupArchivedDocuments()
     return deleted_count
 end
 
+function ReadwiseReader:reconcileLocalDocuments(server_documents)
+    -- Remove local articles that no longer exist on server or no longer match filters
+    self:showProgress("Checking for removed articles…")
+
+    -- Build a set of document IDs that should exist locally
+    local server_ids = {}
+    for _, doc in ipairs(server_documents) do
+        server_ids[doc.id] = true
+    end
+
+    local removed_count = 0
+
+    -- Scan local directory for Readwise articles
+    self:forEachLocalDocument(function(doc_id, filepath)
+        if not server_ids[doc_id] then
+            logger.dbg("ReadwiseReader:reconcileLocalDocuments: removing", filepath, "- no longer matches server state")
+            FileManager:deleteFile(filepath, true)
+            self:removeAuthorMetadata(doc_id)
+            removed_count = removed_count + 1
+        end
+    end)
+
+    logger.dbg("ReadwiseReader:reconcileLocalDocuments: removed", removed_count, "articles no longer on server")
+    return removed_count
+end
+
 function ReadwiseReader:documentExists(doc_id)
     return self:findLocalDocumentByReadwiseId(doc_id) ~= nil
 end
@@ -1320,8 +1391,6 @@ function ReadwiseReader:downloadDocument(document)
         logger.dbg("ReadwiseReader:downloadDocument: skipping", document.id, "- already exists")
         return "skipped"
     end
-    
-    self:showProgress(string.format("Processing: %s", document.title or "Untitled"))
     
     -- Store author metadata from the API
     self:storeAuthorMetadata(document.id, document.author)
@@ -1366,7 +1435,8 @@ function ReadwiseReader:downloadDocument(document)
     
     if success then
         logger.dbg("ReadwiseReader:downloadDocument: saved", document.id, "to", filepath)
-    
+
+        -- Write metadata sidecar file for KOReader library integration
         local status, err = pcall(function() self:setDocumentMetadata(filepath, document) end)
         if not status then
             logger.warn("ReadwiseReader:downloadDocument: metadata writing failed:", err)
@@ -1391,7 +1461,12 @@ function ReadwiseReader:processHtmlContent(content, document)
     local total_article_size = #decoded_content  -- Start with text size
     local max_article_size = self.max_image_size_mb * 1024 * 1024
     local images_stopped = false
-    
+
+    if total_article_size > max_article_size then
+        images_stopped = true
+        logger.dbg("ReadwiseReader:processHtmlContent: text content already exceeds size limit, skipping all image downloads")
+    end
+
     local html = string.format([[
 <!DOCTYPE html>
 <html>
@@ -1762,6 +1837,9 @@ function ReadwiseReader:fetchAndEncodeImage(url)
 end
 
 function ReadwiseReader:showProgress(text)
+    if self.progress_message then
+        UIManager:close(self.progress_message)
+    end
     self.progress_message = InfoMessage:new{text = text, timeout = 1}
     UIManager:show(self.progress_message)
     UIManager:forceRePaint()
@@ -1776,8 +1854,8 @@ end
 
 function ReadwiseReader:archiveDocument(document_id)
     logger.dbg("ReadwiseReader:archiveDocument: archiving", document_id)
-    
-    local endpoint = "/update/" .. document_id
+
+    local endpoint = "/update/" .. document_id .. "/"
     local body = {
         location = "archive"
     }
@@ -1878,22 +1956,24 @@ function ReadwiseReader:synchronize()
     end
     
     local cleaned_count = self:cleanupArchivedDocuments()
-    self:hideProgress()
     
     self:showProgress("Processing finished articles…")
     local archived_count, deleted_count = self:processFinishedDocuments()
-    self:hideProgress()
     
     self:showProgress("Getting document list…")
     local documents = self:getDocumentList()
-    self:hideProgress()
     
     if not documents then
+        self:hideProgress()
         UIManager:show(InfoMessage:new{ text = "Failed to get document list from Readwise Reader." })
         return
     end
     
     self:updateAvailableTags(documents)
+
+    -- Remove local articles that no longer match server state
+    local reconciled_count = self:reconcileLocalDocuments(documents)
+    self:hideProgress()
 
     local filtered_documents = {}
     local existing_count = 0
@@ -1906,11 +1986,13 @@ function ReadwiseReader:synchronize()
         end
     end
 
-    if #filtered_documents == 0 and cleaned_count == 0 and archived_count == 0 and highlights_exported == 0 then
+    if #filtered_documents == 0 and cleaned_count == 0 and archived_count == 0 and highlights_exported == 0 and reconciled_count == 0 then
         local msg = "No new articles found and no changes to process."
         if existing_count > 0 then
             msg = msg .. "\n" .. string.format("Skipped %d existing articles.", existing_count)
         end
+        
+        self:hideProgress()
         UIManager:show(InfoMessage:new{ text = msg })
         
         self.last_sync_time = sync_start_time
@@ -1923,7 +2005,7 @@ function ReadwiseReader:synchronize()
     local failed = 0
     
     for i, document in ipairs(filtered_documents) do
-        self:showProgress(string.format("Downloading %d of %d…", i, #filtered_documents))
+        self:showProgress(string.format("Downloading %d of %d: %s", i, #filtered_documents, document.title))
         
         local result = self:downloadDocument(document)
         
@@ -1956,7 +2038,7 @@ function ReadwiseReader:synchronize()
     end
     
     if skipped > 0 then
-        msg = msg .. "\n" .. string.format("Skipped (other): %d", skipped)
+        msg = msg .. "\n" .. string.format("Skipped (tags or location): %d", skipped)
     end
     
     if failed > 0 then
@@ -1966,13 +2048,17 @@ function ReadwiseReader:synchronize()
     if cleaned_count > 0 then
         msg = msg .. "\n" .. string.format("Cleaned up archived: %d", cleaned_count)
     end
-    
+
+    if reconciled_count > 0 then
+        msg = msg .. "\n" .. string.format("Removed (no longer on server): %d", reconciled_count)
+    end
+
     if archived_count > 0 then
         msg = msg .. "\n" .. string.format("Archived in Readwise: %d", archived_count)
         msg = msg .. "\n" .. string.format("Deleted locally: %d", deleted_count)
     end
     
-    if downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and excluded_count == 0 and existing_count == 0 and highlights_exported == 0 then
+    if downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and reconciled_count == 0 and existing_count == 0 and highlights_exported == 0 then
         msg = msg .. "\n" .. "No changes to process."
     end
     
@@ -2008,6 +2094,7 @@ function ReadwiseReader:saveSettings()
         download_images = self.download_images,
         max_image_size_mb = self.max_image_size_mb,
         max_articles_to_download = self.max_articles_to_download,
+        sync_only_koreader_tag = self.sync_only_koreader_tag,
     }
     self.readwise_settings:saveSetting("readwisereader", settings)
     self.readwise_settings:flush()
