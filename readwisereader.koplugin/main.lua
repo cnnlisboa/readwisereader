@@ -501,7 +501,7 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 }
             },
             {
-                text = "Version 2.1 beta",
+                text = "Version 2.2 beta",
                 enabled = false,
             },
         },
@@ -1060,11 +1060,38 @@ function ReadwiseReader:callAPI(method, endpoint, body, quiet)
     
     -- Apply rate limiting before making the call
     self:checkRateLimit()
-    
-    socketutil:set_timeout(10, 60)
-    local code, resp_headers, status = socket.skip(1, http.request(request))
-    socketutil:reset_timeout()
-    
+
+    -- Retry logic for HTTPS/wantread errors (common on Kindle devices)
+    local max_retries = 3
+    local retry_delay = 2  -- seconds
+    local code, resp_headers, status
+
+    for attempt = 1, max_retries do
+        socketutil:set_timeout(10, 60)
+        code, resp_headers, status = socket.skip(1, http.request(request))
+        socketutil:reset_timeout()
+
+        -- If we got a response, break out of retry loop
+        if resp_headers ~= nil then
+            break
+        end
+
+        -- Check if it's a wantread error (HTTPS issue on Kindle)
+        local error_msg = tostring(status or code or "")
+        if error_msg:match("wantread") and attempt < max_retries then
+            logger.dbg("ReadwiseReader:callAPI: wantread error, retrying", attempt, "of", max_retries)
+            socket.sleep(retry_delay)
+            -- Recreate sink for retry
+            sink = {}
+            request.sink = ltn12.sink.table(sink)
+            if body then
+                request.source = ltn12.source.string(json_body)
+            end
+        else
+            break
+        end
+    end
+
     if resp_headers == nil then
         logger.err("ReadwiseReader:callAPI: network error", status or code)
         if not quiet then
@@ -1137,8 +1164,8 @@ function ReadwiseReader:getDocumentList()
                 local location_display = location == "new" and "Inbox" or (location:sub(1,1):upper() .. location:sub(2))
                 self:showProgress(string.format("Getting %s articles (%d kept)…", location_display, #documents))
 
-                -- Fetch with HTML content and tags for batch processing
-                local endpoint = "/list/?location=" .. location .. "&withHtmlContent=true&withTags=true"
+                -- Fetch with HTML content for batch processing
+                local endpoint = "/list/?location=" .. location .. "&withHtmlContent=true"
                 if self.sync_only_koreader_tag then
                     endpoint = endpoint .. "&tag=koreader"
                 end
@@ -1778,8 +1805,8 @@ end
 
 function ReadwiseReader:archiveDocument(document_id)
     logger.dbg("ReadwiseReader:archiveDocument: archiving", document_id)
-    
-    local endpoint = "/update/" .. document_id
+
+    local endpoint = "/update/" .. document_id .. "/"
     local body = {
         location = "archive"
     }
@@ -1962,7 +1989,7 @@ function ReadwiseReader:synchronize()
     end
     
     if skipped > 0 then
-        msg = msg .. "\n" .. string.format("Skipped (other): %d", skipped)
+        msg = msg .. "\n" .. string.format("Skipped (tags or location): %d", skipped)
     end
     
     if failed > 0 then
@@ -1982,7 +2009,7 @@ function ReadwiseReader:synchronize()
         msg = msg .. "\n" .. string.format("Deleted locally: %d", deleted_count)
     end
     
-    if downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and excluded_count == 0 and existing_count == 0 and highlights_exported == 0 then
+    if downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and reconciled_count == 0 and existing_count == 0 and highlights_exported == 0 then
         msg = msg .. "\n" .. "No changes to process."
     end
     
