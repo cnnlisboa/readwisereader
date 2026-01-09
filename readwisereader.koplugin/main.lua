@@ -7,6 +7,7 @@
 -- MAIN FEATURES:
 -- - Downloads articles from Readwise Reader "later" and "shortlist" locations
 -- - Converts articles to HTML format with embedded images
+-- - Generates KOReader metadata sidecars (.sdr) for enhanced library integration
 -- - Offers filtering by article tags, location and type
 -- - Archives finished articles back to Readwise
 -- - Exports highlights and notes to Readwise
@@ -212,6 +213,47 @@ function ReadwiseReader:getDocumentAuthorFromFile(filepath)
         return self:getStoredAuthor(doc_id)
     end
     return nil
+end
+
+-- ===============================================================================
+-- METADATA SIDECAR FILE MANAGEMENT
+-- ===============================================================================
+
+function ReadwiseReader:setDocumentMetadata(filepath, document)
+    local custom_doc_settings = DocSettings.openSettingsFile()
+    local props = {}
+
+    if document.title and document.title ~= "" then
+        props.title = document.title
+    end
+
+    if document.author and document.author ~= "" then
+        props.authors = document.author
+    end
+
+    if self.document_tags and self.document_tags[document.id] and #self.document_tags[document.id] > 0 then
+        props.keywords = table.concat(self.document_tags[document.id], "\n")
+        logger.dbg("ReadwiseReader:setDocumentMetadata: set keywords:", props.keywords)
+    end
+
+    if document.summary and document.summary ~= "" then
+        props.description = document.summary
+    end
+
+    -- Both doc_props and custom_props need to exist, otherwise KOReader will crash
+    custom_doc_settings:saveSetting("doc_props", props)
+    custom_doc_settings:saveSetting("custom_props", props)
+
+    local success = custom_doc_settings:flushCustomMetadata(filepath)
+
+    if success then
+        -- Broadcast events to ensure metadata is reliably picked up
+        UIManager:broadcastEvent(Event:new("InvalidateMetadataCache", filepath))
+        UIManager:broadcastEvent(Event:new("BookMetadataChanged"))
+        logger.dbg("ReadwiseReader:setDocumentMetadata: wrote custom metadata for", filepath)
+    else
+        logger.warn("ReadwiseReader:setDocumentMetadata: failed to write custom metadata for", filepath)
+    end
 end
 
 -- ===============================================================================
@@ -501,7 +543,7 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 }
             },
             {
-                text = "Version 2.2 beta",
+                text = "Version 2.3 beta",
                 enabled = false,
             },
         },
@@ -1164,8 +1206,8 @@ function ReadwiseReader:getDocumentList()
                 local location_display = location == "new" and "Inbox" or (location:sub(1,1):upper() .. location:sub(2))
                 self:showProgress(string.format("Getting %s articles (%d kept)…", location_display, #documents))
 
-                -- Fetch with HTML content for batch processing
-                local endpoint = "/list/?location=" .. location .. "&withHtmlContent=true"
+                -- Fetch with HTML content and tags for batch processing
+                local endpoint = "/list/?location=" .. location .. "&withHtmlContent=true&withTags=true"
                 if self.sync_only_koreader_tag then
                     endpoint = endpoint .. "&tag=koreader"
                 end
@@ -1393,6 +1435,13 @@ function ReadwiseReader:downloadDocument(document)
     
     if success then
         logger.dbg("ReadwiseReader:downloadDocument: saved", document.id, "to", filepath)
+
+        -- Write metadata sidecar file for KOReader library integration
+        local status, err = pcall(function() self:setDocumentMetadata(filepath, document) end)
+        if not status then
+            logger.warn("ReadwiseReader:downloadDocument: metadata writing failed:", err)
+        end
+
         return "downloaded"
     else
         logger.err("ReadwiseReader:downloadDocument: failed to write file")
