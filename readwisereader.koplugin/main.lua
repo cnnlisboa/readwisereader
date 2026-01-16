@@ -543,7 +543,7 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 }
             },
             {
-                text = "Version 2.3 beta",
+                text = "Version 2.3",
                 enabled = false,
             },
         },
