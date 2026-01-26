@@ -110,8 +110,13 @@ function ReadwiseReader:init()
     self.sync_start_time = nil
     self.needs_rate_limiting = false
 
-    -- Initialize highlights parser
-    self.parser = MyClipping:new{}
+    -- Initialize highlights parser with a mock UI to satisfy new clip.lua requirements
+    local mock_ui = {
+        bookinfo = {
+            extendProps = function(props) return props or {} end
+        }
+    }
+    self.parser = MyClipping:new{ ui = mock_ui }
     
     self.ui.menu:registerToMainMenu(self)
 end
@@ -543,7 +548,7 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 }
             },
             {
-                text = "Version 2.3",
+                text = "Version 2.4",
                 enabled = false,
             },
         },
