@@ -4,6 +4,16 @@ This fork continues from [tomtom800/readwisereader](https://github.com/tomtom800
 v2.6 (via [Endle/readwisereader](https://github.com/Endle/readwisereader)). Versions start at
 3.0.0 so they never collide with upstream release numbers.
 
+## [3.1.0] - 2026-10-28
+
+### Added
+- Highlights made in a downloaded Reader article or a linked local book are now placed on their
+  passage in Readwise Reader itself, using Reader's highlight API, so they show inline in Reader.
+  Only highlights made after this update is installed are placed; older ones keep exporting the
+  old way so Readwise doesn't get duplicates. A passage Reader can't find falls back to the old
+  export, and the sync reports how many. Note edits in KOReader update the Reader highlight.
+  Deleting a highlight in KOReader does not delete it in Reader.
+
 ## [3.0.0] - 2026-10-28
 
 First release of this fork.

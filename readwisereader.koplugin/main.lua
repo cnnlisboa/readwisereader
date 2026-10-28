@@ -65,6 +65,7 @@ local Progress = require("library/progress")
 local ProgressNote = require("library/progress_note")
 local ReaderAPI = require("api/reader")
 local HighlightsAPI = require("api/highlights")
+local ReaderHighlightsAPI = require("api/reader_highlights")
 local HighlightsReadAPI = require("api/highlights_read")
 local Browser = require("ui/browser")
 local HighlightsBrowser = require("ui/highlights")
@@ -185,6 +186,14 @@ function ReadwiseReader:init()
     -- (onNetworkConnected) or the next sync runs.
     self.pending_link_saves = settings.pending_link_saves or {}
 
+    -- Highlights in Reader documents are placed in Reader itself (see
+    -- api/reader_highlights.lua). Only those made from the first launch of this
+    -- version onward qualify, since older ones may already be in Readwise
+    -- through v2 and placing them too would duplicate them.
+    self.reader_placement_since = settings.reader_placement_since or os.time()
+    -- Reader document id -> annotation key -> placement record.
+    self.reader_highlight_records = settings.reader_highlight_records or {}
+
     -- Initialize max articles download limit
     self.max_articles_to_download = settings.max_articles_to_download or 0 -- 0 = unlimited
 
@@ -219,6 +228,11 @@ function ReadwiseReader:init()
             return self:makeJsonRequest(HIGHLIGHTS_API_ENDPOINT .. endpoint, method, body, {
                 ["Authorization"] = "Token " .. self.access_token,
             })
+        end,
+    }
+    self.reader_highlights_api = ReaderHighlightsAPI:new{
+        request = function(method, endpoint, body)
+            return self:callAPI(method, endpoint, body, true)
         end,
     }
     self.highlights_read_api = HighlightsReadAPI:new{
@@ -1009,6 +1023,9 @@ function ReadwiseReader:buildHighlightContext(booknotes)
         -- with neither we send no highlight_url at all -- Readwise's own
         -- title/author/text/source_url de-duplication still applies.
         highlight_url_base = (linked_metadata and linked_metadata.reader_url) or source_url,
+        -- Set only for a known Reader document, which is what lets its
+        -- highlights be placed in Reader instead of exported through v2.
+        reader_document_id = linked_metadata and linked_metadata.id or nil,
     }
 end
 
@@ -1031,32 +1048,77 @@ function ReadwiseReader:exportHighlights()
     end
 
     local books = {}
+    local since = self.reader_placement_since
+    local placement = { placed = 0, updated = 0, unplaced = 0, failures = {} }
+    local placement_ran = false
     for _title, booknotes in pairs(clippings) do
+        local context = self:buildHighlightContext(booknotes)
+        local document_id = context.reader_document_id
+        if document_id then
+            -- Reader placement runs first so a passage Reader refuses is
+            -- already marked as a v2 fallback when the v2 export below runs.
+            local records = self.reader_highlight_records[document_id] or {}
+            local book_report = self.reader_highlights_api:exportBook(
+                document_id, context.title or "Untitled", booknotes, records, since)
+            if next(records) then
+                self.reader_highlight_records[document_id] = records
+                placement_ran = true
+            end
+            placement.placed = placement.placed + book_report.placed
+            placement.updated = placement.updated + book_report.updated
+            placement.unplaced = placement.unplaced + book_report.unplaced
+            for _, failure in ipairs(book_report.failures) do
+                table.insert(placement.failures, failure)
+            end
+            context.include = function(clipping)
+                return ReaderHighlightsAPI.sendsToV2(clipping, records, since)
+            end
+        end
         table.insert(books, {
             booknotes = booknotes,
-            context = self:buildHighlightContext(booknotes),
+            context = context,
         })
     end
+    if placement_ran then
+        self:saveSettings()
+    end
+    logger.dbg("ReadwiseReader:exportHighlights: placed in Reader", placement.placed,
+        "notes updated", placement.updated, "unplaced", placement.unplaced,
+        "failed", #placement.failures)
 
     local report = self.highlights_api:export(books)
     logger.dbg("ReadwiseReader:exportHighlights: sent", report.sent, "confirmed", report.confirmed,
         "skipped", #report.skipped, "failed", #report.failures)
+    for _, failure in ipairs(placement.failures) do
+        table.insert(report.failures, failure)
+    end
 
     -- Readwise silently ignores a highlight it considers a duplicate, so
     -- `confirmed` being lower than `sent` is the normal steady state on a
     -- re-sync and is not worth reporting as a problem. Only genuine rejections
-    -- are surfaced.
+    -- are surfaced, along with passages Reader could not place, which still
+    -- reached Readwise through v2 but without a position in the article.
+    local messages = {}
     local problems, problem_count = HighlightsAPI.summarizeProblems(report, 3)
     if problems then
         logger.warn("ReadwiseReader:exportHighlights: highlight export problems:", problems)
+        table.insert(messages,
+            string.format("%d highlight(s) could not be exported:\n%s", problem_count, problems))
+    end
+    if placement.unplaced > 0 then
+        table.insert(messages, string.format(
+            "%d highlight(s) could not be placed in Reader and were exported without a position.",
+            placement.unplaced))
+    end
+    if #messages > 0 then
         UIManager:show(InfoMessage:new{
-            text = string.format("%d highlight(s) could not be exported:\n%s", problem_count, problems),
+            text = table.concat(messages, "\n\n"),
             timeout = 5
         })
     end
 
     self:hideProgress()
-    return report.confirmed, nil
+    return report.confirmed + placement.placed + placement.updated, nil
 end
 
 function ReadwiseReader:isDocReady()
@@ -3720,6 +3782,8 @@ function ReadwiseReader:saveSettings()
         progress_state = self.progress_state,
         pending_progress_seeds = self.pending_progress_seeds,
         pending_link_saves = self.pending_link_saves,
+        reader_placement_since = self.reader_placement_since,
+        reader_highlight_records = self.reader_highlight_records,
     }
     self.readwise_settings:saveSetting("readwisereader", settings)
     self.readwise_settings:flush()

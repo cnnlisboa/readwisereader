@@ -65,13 +65,10 @@ end
 -- A highlight's identity has to survive the user editing its text or its note,
 -- otherwise the edit lands in Readwise as a duplicate rather than a revision.
 -- KOReader's annotation datetime is assigned at creation and is not touched by
--- later edits, so it anchors the URL; the position pointer disambiguates the
--- case of two highlights made inside the same second.
-function Highlights.buildHighlightUrl(base_url, clipping)
-    base_url = stringOrNil(base_url)
-    if not base_url then
-        return nil
-    end
+-- later edits, so it anchors the key; the position pointer disambiguates the
+-- case of two highlights made inside the same second. Shared with
+-- api/reader_highlights.lua, which keys its placed-highlight records on it.
+function Highlights.annotationKey(clipping)
     local parts = {}
     if type(clipping.time) == "number" and clipping.time > 0 then
         table.insert(parts, tostring(clipping.time))
@@ -83,7 +80,16 @@ function Highlights.buildHighlightUrl(base_url, clipping)
     if #parts == 0 then
         return nil
     end
-    return base_url .. "#koreader-" .. table.concat(parts, "-")
+    return table.concat(parts, "-")
+end
+
+function Highlights.buildHighlightUrl(base_url, clipping)
+    base_url = stringOrNil(base_url)
+    local key = Highlights.annotationKey(clipping)
+    if not base_url or not key then
+        return nil
+    end
+    return base_url .. "#koreader-" .. key
 end
 
 -- `context` carries the fields that decide which Readwise book the highlight
@@ -138,17 +144,21 @@ end
 
 -- Flattens one book's nested chapter/clipping structure into payloads, and
 -- reports the highlights it had to drop rather than letting them vanish into a
--- book-level success.
+-- book-level success. An optional context.include(clipping) leaves out
+-- highlights another path owns (those placed in Reader through v3) while still
+-- counting them, so the order fallback of the rest does not shift.
 function Highlights.buildBook(booknotes, context)
     local payloads, skipped, order = {}, {}, 0
     for _, chapter in ipairs(booknotes) do
         for _, clipping in ipairs(chapter) do
             order = order + 1
-            local highlight, err = Highlights.buildHighlight(clipping, context, order)
-            if highlight then
-                table.insert(payloads, highlight)
-            else
-                table.insert(skipped, string.format("highlight %d: %s", order, err))
+            if not context.include or context.include(clipping) then
+                local highlight, err = Highlights.buildHighlight(clipping, context, order)
+                if highlight then
+                    table.insert(payloads, highlight)
+                else
+                    table.insert(skipped, string.format("highlight %d: %s", order, err))
+                end
             end
         end
     end

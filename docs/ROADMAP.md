@@ -76,16 +76,18 @@ See [the detailed Phase 1 plan](PHASE-1.md).
 
 ## Known API limitations
 
-- **There is no public write path for Reader-anchored highlights.** Verified
-  2026-08-31 against both surfaces. The documented Reader REST API exposes only
-  `save`, `list`, `update`, `bulk_update`, `delete` and `tags` -- no highlight
-  CREATE. Readwise's public MCP server (`https://mcp.readwise.io/sse`, OAuth via
-  `https://readwise.io/o/authorize/`) answers `tools/list` with exactly two
-  tools, `search` and `fetch`, and describes itself as providing "search and
-  retrieval capabilities ... for Chat and Deep Research". A
-  `reader_create_highlight` operation exists in Readwise's first-party
-  integration with some chat clients, but it is not reachable from this plugin
-  and must not be planned against. Re-check before revisiting Reader anchoring.
+- **Reader-anchored highlights are now writable** (rechecked 2026-10-28; this
+  replaces the 2026-08-31 finding that there was no public write path). The
+  Reader API creates a highlight with `POST /api/v3/save/` taking `parent_id`
+  (the document) and `content` (the passage, which must match the parent's text
+  or the call returns 400 and creates nothing), plus optional `notes`/`tags`.
+  `PATCH /api/v3/update/<id>/` accepts only `notes` and `tags` on a highlight,
+  `DELETE /api/v3/delete/<id>/` removes it with its note, and LIST returns
+  highlights as child documents with `notes`, `highlight_location` and
+  `highlight_offset`. Readwise also fixed anchoring of API-created highlights
+  in long EPUBs. `api/reader_highlights.lua` uses this for downloaded and
+  explicitly linked Reader documents; text edits cannot follow a placed
+  highlight, and deletions are deliberately not sent.
 - v2 highlight CREATE de-dupes on `title`/`author`/`text`/`source_url`, so
   re-sending an unchanged highlight is a no-op server-side. An *edited* one is a
   new highlight unless it carries a stable `highlight_url`, which the endpoint
