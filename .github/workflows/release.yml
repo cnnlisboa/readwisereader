@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LuaJIT
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends luajit
+
+      # The tag and _meta.lua must agree, otherwise the version shown in the
+      # plugin's menu would not match the release users downloaded.
+      - name: Check tag matches _meta.lua
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          meta=$(sed -nE 's/^[[:space:]]*version = "([^"]+)".*/\1/p' readwisereader.koplugin/_meta.lua)
+          if [ "$tag" != "$meta" ]; then
+            echo "::error::tag v$tag does not match _meta.lua version $meta"
+            exit 1
+          fi
+
+      - name: Syntax check and unit tests
+        run: |
+          status=0
+          for f in $(git ls-files '*.lua'); do
+            luajit -e "assert(loadfile('$f'))" || status=1
+          done
+          for f in tests/test_*.lua; do
+            echo "== $f"
+            luajit "$f" || status=1
+          done
+          exit $status
+
+      # Only the plugin folder goes in the zip, so users can copy it straight
+      # into koreader/plugins without dragging tests and docs onto the device.
+      - name: Build zip
+        run: |
+          zip -r "readwisereader-${GITHUB_REF_NAME}.zip" readwisereader.koplugin -x '*.DS_Store'
+
+      # Release notes are the matching "## [x.y.z]" section of CHANGELOG.md.
+      - name: Extract release notes
+        run: |
+          awk -v ver="${GITHUB_REF_NAME#v}" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::no CHANGELOG.md section for ${GITHUB_REF_NAME#v}"
+            exit 1
+          fi
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "readwisereader-${GITHUB_REF_NAME}.zip" \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md

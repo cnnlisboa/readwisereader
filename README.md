@@ -1,7 +1,14 @@
 # A KOReader plugin for Readwise and Readwise Reader
 A plugin for KOReader integration with the highlight saving and read later services Readwise and Readwise Reader. A Readwise subscription is required. 
 
+> This is a fork of [tomtom800/readwisereader](https://github.com/tomtom800/readwisereader) (by way of [Endle/readwisereader](https://github.com/Endle/readwisereader)). It adds library browsing and search, Quick/Long Reads and In Progress views, an on-device highlights browser, Save to Readwise Later, and more. See the [CHANGELOG](CHANGELOG.md) for everything that changed. Fork versions start at 3.0.0 so they never clash with upstream releases. Please report bugs with this fork [here](https://github.com/cnnlisboa/readwisereader/issues), not upstream.
+
 ## Key features:
+- **Browse Reader** lists your Inbox, Later and Shortlist, so you can pick individual articles to download instead of syncing everything.
+- **Search Library** searches titles, authors, sites, summaries and tags across Inbox, Later, Shortlist, Archive and Feed.
+- **Views** gives you Quick Reads (5 minutes or less), Long Reads (20 minutes or more) and In Progress, modelled on Reader's own smart views.
+- **Highlights** lets you read your Readwise highlights on the device: browse by Books, Articles, Tweets or Podcasts, search them, or go through today's Daily Review. Highlights open full-screen with Previous/Next paging.
+- Downloaded articles get Reader's cover image as their KOReader cover (can be turned off).
 - Articles in Readwise Reader saved to “Inbox”, “Later” or “Shortlist” are downloaded to KOReader as HTML files.
 - Images are downloaded where this is possible.
 - Articles which have been read in KOReader and marked as “finished” will be moved to the Readwise Reader Archive at the next sync, and deleted from KOReader.
@@ -26,6 +33,24 @@ A plugin for KOReader integration with the highlight saving and read later servi
 - **Linked book progress** is manual and one book at a time. Sending progress writes only a marked `KOReader progress: N%` line to the Reader document note, preserving other note text. Applying Reader progress moves the open KOReader book to Reader's percentage approximately; it does not create a continuous progress sync.
 - I am not planning to add any options to style the documents. However there are lots of tweaks you can apply as a user - see [here](https://koreader.rocks/user_guide/#L1-customizingappearance). 
 
+## Browse, search, and views
+
+Everything here works on metadata only, so it is quick and light on memory. Nothing downloads until you ask for it.
+
+- **Readwise Reader → Browse Reader** lists Inbox, Later or Shortlist. Tap an article to select it, open its details if you want the summary, then choose **Download selected**. Use **Load more** for the next page and **Refresh list** to fetch it again.
+- **Readwise Reader → Search Library** searches titles, authors, sites, summaries and tags across Inbox, Later, Shortlist, Archive and Feed. Reader's API has no search, so the plugin scans one page at a time; choose **Search next page** to keep going.
+- **Readwise Reader → Views** offers Quick Reads (5 minutes or less), Long Reads (20 minutes or more) and In Progress. These scan Inbox, Later, Shortlist and Archive, not Feed.
+- Podcasts and audiobooks never appear, because Reader only provides their show notes. Videos (YouTube transcripts) appear unless you turn off **Settings → Show videos when browsing**.
+
+## Read your highlights
+
+**Readwise Reader → Highlights** is read-only. It shows what is already in Readwise; it does not change anything there.
+
+- Pick **Books**, **Articles**, **Tweets** or **Podcasts**, then a title, to see its highlights.
+- **Search Highlights** searches highlight text and notes.
+- **Daily Review** shows today's review as Readwise sends it.
+- A highlight opens full-screen. Use **◀ Previous** / **Next ▶** to page through, or **View all highlights in this book** to jump to the rest.
+
 ## Link a local book to Reader
 
 1. Open the sideloaded book in KOReader.
@@ -42,39 +67,48 @@ For a linked, open local book, choose **Readwise Reader → Linked book progress
 - Remove only the marked KOReader-progress line from the Reader note after confirmation.
 
 ## Installation:
-- Download the [ZIP of the plugin](https://github.com/Endle/readwisereader/releases/). Extract it.
-- Attach your ereader to your computer. Copy the `readwisereader.koplugin` folder containing _meta.lua and main.lua from the extracted folder to the `koreader/plugins` folder. Restart KOReader.
+- Download `readwisereader-vX.Y.Z.zip` from the [latest release](https://github.com/cnnlisboa/readwisereader/releases/latest). Extract it.
+- Attach your ereader to your computer. Copy the `readwisereader.koplugin` folder containing _meta.lua and main.lua from the extracted folder to the `koreader/plugins` folder. If you had the upstream plugin installed, replace its folder; your settings are kept. Restart KOReader.
 - The plugin requires a Readwise access token, which subscribers can obtain [here](https://readwise.io/access_token).
-- The token can be typed in manually in the Readwise Reader/Settings/Configure Readwise Reader menu, but this is difficult to do correctly. It's easy to be confused by the letter O and the number 0, or the lowercase letter l, the uppercase letter I and the numeral 1. If the plugin is not working, check this first.
-- You may prefer to copy and paste the access token directly from your computer into KOReader settings. To do this, first set the folder you want to download to in the Readwise Reader/Settings/Download folder menu. This will create the file koreader/settings/readwisereader.lua. Add the access token to this file in the following format:
+- The token can be typed in manually in the **Readwise Reader → Settings → Configure Readwise Reader** menu, but this is difficult to do correctly. It's easy to be confused by the letter O and the number 0, or the lowercase letter l, the uppercase letter I and the numeral 1. If the plugin is not working, check this first.
+- Set where articles are saved in **Readwise Reader → Settings → Article download directory**.
+- You may prefer to paste the access token from your computer instead. The plugin creates `koreader/settings/readwisereader.lua` the first time KOReader starts with it installed. With KOReader closed, open that file and set `access_token` (and `directory`, if you haven't chosen a folder yet). Leave any other keys as they are; the plugin fills them in itself. A minimal file looks like this:
 
 ```
 -- ./settings/readwisereader.lua
 return {
     ["readwisereader"] = {
         ["access_token"] = "{access token}",
-        ["available_locations"] = {},
-        ["available_tags"] = {},
         ["directory"] = "{download location}",
-        ["document_categories"] = {},
-        ["document_locations"] = {},
-        ["document_tags"] = {},
-        ["excluded_locations"] = {},
-        ["excluded_tags"] = {},
-        ["max_articles_to_download"] = 0,  -- 0 = unlimited
     },
 }
 ```
-- The extension is then activated by selecting “Sync” in the Readwise Reader menu.
+- Then choose **Readwise Reader → Sync now**.
 - By default, the extension will be added to the file menu with the prefix NEW:. The plugin will work in this format, but to remove the NEW: prefix and to move it to a different menu, add a line for  `"readwisereader",` in the appropriate place in koreader/frontend/ui/elements/filemanager_menu_order.lua
 
 ## Bug reporting
-If reporting a bug, especially one that causes KOReader to crash, please share logging from your device in koreader/crash.log. Errors and crashes are clearly marked. To ensure that you just capture the relevant logs, delete the file, let KOReader regenerate it for you, then save the file after the issue has occurred.
+Report bugs on [this fork's issue tracker](https://github.com/cnnlisboa/readwisereader/issues), and include the plugin version shown at the bottom of the Readwise Reader menu. If reporting a bug, especially one that causes KOReader to crash, please share logging from your device in koreader/crash.log. Errors and crashes are clearly marked. To ensure that you just capture the relevant logs, delete the file, let KOReader regenerate it for you, then save the file after the issue has occurred.
 
 ## Development
 Notes for devs and power-users. Don't proceed unless you know the meaning of each step.
 
-## Project planning
+### Tests
+Unit tests cover the modules that run without KOReader and stub all network calls. Run them with LuaJIT from the repository root; see [tests/README.md](tests/README.md) for details.
+
+```
+for f in tests/test_*.lua; do luajit "$f" || break; done
+```
+
+CI runs luacheck, a LuaJIT syntax check and these tests on every push and pull request.
+
+### Releasing
+1. Bump `version` in `readwisereader.koplugin/_meta.lua`. The plugin menu reads the version from there.
+2. Add a `## [x.y.z] - YYYY-MM-DD` section to [CHANGELOG.md](CHANGELOG.md).
+3. Commit, then tag and push: `git tag vx.y.z && git push origin main vx.y.z`.
+
+The Release workflow checks that the tag matches `_meta.lua`, runs the tests, zips only `readwisereader.koplugin/`, and publishes a GitHub release with that version's changelog section as its notes.
+
+### Project planning
 
 - [Architecture and API capability matrix](docs/ARCHITECTURE.md)
 - [Phased roadmap](docs/ROADMAP.md)
@@ -84,7 +118,7 @@ Notes for devs and power-users. Don't proceed unless you know the meaning of eac
 KOReader has [Linux release](https://github.com/koreader/koreader/wiki/Installation-on-desktop-linux), so it's a breeze to test this plugin on Linux.
 
 1. Install KOReader [via Flatpak](https://flathub.org/en/apps/rocks.koreader.KOReader)
-2. `git clone git@github.com:Endle/readwisereader.git`
+2. `git clone git@github.com:cnnlisboa/readwisereader.git`
 3. Check plugin directory `$HOME/.var/app/rocks.koreader.KOReader/config/koreader/plugins` - Thanks to [MountainToppish](https://www.reddit.com/r/koreader/comments/1mt7g9x/how_to_add_plugins_to_koreader_installed_from/)
 4. Install the plugin by `cd  $HOME/.var/app/rocks.koreader.KOReader/config/koreader/plugins && ln -s $HOME/<source_path>/readwisereader.koplugin`
 5. Restart KOReader

@@ -9,11 +9,17 @@ never touch a real Readwise account.
 Run them from the repository root with the same runtime KOReader ships:
 
     luajit tests/test_browser.lua
+    luajit tests/test_downloadprogress.lua
     luajit tests/test_highlights.lua
     luajit tests/test_highlights_read.lua
     luajit tests/test_local_links.lua
+    luajit tests/test_progress.lua
     luajit tests/test_progress_note.lua
     luajit tests/test_reader.lua
+
+or all of them at once:
+
+    for f in tests/test_*.lua; do luajit "$f" || break; done
 
 Anything that requires KOReader's own modules (`clip`, `docsettings`,
 `readhistory`, ...) or a live API token is out of scope here and still has to be

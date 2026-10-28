@@ -1067,6 +1067,16 @@ end
 -- MAIN MENU AND UI
 -- ===============================================================================
 
+-- _meta.lua is the single source of the version; KOReader's plugin loader sets
+-- self.path to the plugin directory.
+function ReadwiseReader:getVersion()
+    if not self.path then
+        return "unknown"
+    end
+    local ok, meta = pcall(dofile, self.path .. "/_meta.lua")
+    return ok and type(meta) == "table" and meta.version or "unknown"
+end
+
 function ReadwiseReader:addToMainMenu(menu_items)
     menu_items.readwisereader = {
         text = "Readwise Reader",
@@ -1479,7 +1489,7 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 }
             },
             {
-                text = "Version 2.5",
+                text = "Version " .. self:getVersion(),
                 enabled = false,
             },
         },
