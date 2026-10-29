@@ -185,6 +185,9 @@ function ReadwiseReader:init()
     -- Links saved while offline wait here until the network is back
     -- (onNetworkConnected) or the next sync runs.
     self.pending_link_saves = settings.pending_link_saves or {}
+    -- Tag edits made while offline: { id, add = {...}, remove = {...} } per
+    -- document, re-applied on top of Reader's current tags at the next sync.
+    self.pending_tag_updates = settings.pending_tag_updates or {}
 
     -- Highlights in Reader documents are placed in Reader itself (see
     -- api/reader_highlights.lua). Only those made from the first launch of this
@@ -219,8 +222,8 @@ function ReadwiseReader:init()
     }
     self.parser = MyClipping:new{ ui = mock_ui, settings = {} }
     self.reader_api = ReaderAPI:new{
-        request = function(method, endpoint)
-            return self:callAPI(method, endpoint, nil, true)
+        request = function(method, endpoint, body)
+            return self:callAPI(method, endpoint, body, true)
         end,
     }
     self.highlights_api = HighlightsAPI:new{
@@ -247,6 +250,11 @@ function ReadwiseReader:init()
         end,
         show_progress = function(text) self:showProgress(text) end,
         hide_progress = function() self:hideProgress() end,
+        known_tags = function()
+            local names = self.reader_api:listTags()
+            return names or self:getKnownTagNames()
+        end,
+        parse_tags = ReaderAPI.parseTags,
     }
     self.browser = Browser:new{
         reader_api = self.reader_api,
@@ -264,6 +272,13 @@ function ReadwiseReader:init()
         hide_progress = function() self:hideProgress() end,
         link_local_book = function(filepath, document)
             return self:linkLocalBookToReader(filepath, document)
+        end,
+        known_tags = function() return self:getKnownTagNames() end,
+        queue_tag_update = function(document_id, add, remove)
+            self:queueTagUpdate(document_id, add, remove)
+        end,
+        on_tags_changed = function(document, tags)
+            self:applyTagsLocally(document, tags)
         end,
     }
     
@@ -1331,6 +1346,23 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                     },
                     {
+                        text_func = function()
+                            local count = self.pending_tag_updates and #self.pending_tag_updates or 0
+                            return count > 0
+                                and string.format("Send queued tag changes (%d)", count)
+                                or "Send queued tag changes"
+                        end,
+                        help_text = "Tag changes made while offline wait here until sent. They also send automatically at the next sync or when the network returns.",
+                        enabled_func = function()
+                            return self.pending_tag_updates and #self.pending_tag_updates > 0
+                        end,
+                        callback = function()
+                            self:runSyncAction(function()
+                                self:flushPendingTagUpdates(true)
+                            end)
+                        end,
+                    },
+                    {
                         text = "Archive finished articles on Readwise",
                         help_text = "Articles you have marked finished here are archived on Readwise and removed from this device.",
                         callback = function()
@@ -2337,6 +2369,114 @@ end
 function ReadwiseReader:onNetworkConnected()
     if self.pending_link_saves and #self.pending_link_saves > 0 then
         self:flushPendingLinkSaves(false)
+    end
+    if self.pending_tag_updates and #self.pending_tag_updates > 0 then
+        self:flushPendingTagUpdates(false)
+    end
+end
+
+-- ===============================================================================
+-- TAG EDITS
+-- ===============================================================================
+
+-- Tag names for the picker when Reader's tag list can't be fetched: the tags
+-- seen on documents during sync, minus the category pseudo-tags.
+function ReadwiseReader:getKnownTagNames()
+    local names = {}
+    for _, tag in ipairs(self.available_tags or {}) do
+        if not self:isDocumentCategory(tag) then
+            table.insert(names, tag)
+        end
+    end
+    return names
+end
+
+-- Keeps the local tag map (used for filters and file keywords) and, when the
+-- article is on this device, its Book Info keywords in step with Reader.
+function ReadwiseReader:applyTagsLocally(document, tags)
+    if type(document) ~= "table" or type(document.id) ~= "string" then
+        return
+    end
+    local combined = {}
+    if type(document.category) == "string" and document.category ~= "" then
+        table.insert(combined, document.category)
+    end
+    for _, tag in ipairs(tags or {}) do
+        table.insert(combined, tag)
+    end
+    self.document_tags[document.id] = combined
+    local filepath = self:findLocalDocumentByReadwiseId(document.id)
+    if filepath then
+        self:setDocumentMetadata(filepath, document)
+    end
+    self:saveSettings()
+end
+
+function ReadwiseReader:queueTagUpdate(document_id, add, remove)
+    local change = { add = add or {}, remove = remove or {} }
+    for _, item in ipairs(self.pending_tag_updates) do
+        if item.id == document_id then
+            local merged = ReaderAPI.mergeTagDiffs(item, change)
+            item.add, item.remove = merged.add, merged.remove
+            self:saveSettings()
+            return
+        end
+    end
+    table.insert(self.pending_tag_updates, {
+        id = document_id, add = change.add, remove = change.remove, queued_at = os.time(),
+    })
+    self:saveSettings()
+end
+
+-- announce=false for the automatic triggers (reconnect, sync), like
+-- flushPendingLinkSaves. A retryable failure keeps the entry for next time; a
+-- permanent one (document deleted, bad token) drops it so it cannot block the
+-- queue forever.
+function ReadwiseReader:flushPendingTagUpdates(announce)
+    if #self.pending_tag_updates == 0 then
+        if announce then
+            UIManager:show(InfoMessage:new{ text = "No queued tag changes to send.", timeout = 3 })
+        end
+        return
+    end
+    if type(self.access_token) ~= "string" or self.access_token == "" then
+        return
+    end
+    if not NetworkMgr:isOnline() then
+        if announce then
+            UIManager:show(InfoMessage:new{ text = "Still offline - queued tag changes will send later.", timeout = 3 })
+        end
+        return
+    end
+
+    local remaining, sent, dropped = {}, 0, 0
+    for _, item in ipairs(self.pending_tag_updates) do
+        local document, err, status = self.reader_api:applyTagChange(item.id, item.add, item.remove)
+        if document then
+            sent = sent + 1
+            self:applyTagsLocally(document, document.tags or {})
+        elseif ReaderAPI.isRetryable(err, status) then
+            table.insert(remaining, item)
+        else
+            dropped = dropped + 1
+            logger.warn("ReadwiseReader:flushPendingTagUpdates: dropping change for", item.id, err, status)
+        end
+    end
+    self.pending_tag_updates = remaining
+    self:saveSettings()
+
+    if announce then
+        local text
+        if sent > 0 and #remaining == 0 then
+            text = string.format("Sent %d queued tag change(s).", sent)
+        elseif sent > 0 then
+            text = string.format("Sent %d queued tag change(s); %d still queued.", sent, #remaining)
+        elseif dropped > 0 then
+            text = string.format("%d queued tag change(s) could not be applied and were discarded.", dropped)
+        else
+            text = "Could not send queued tag changes yet."
+        end
+        UIManager:show(InfoMessage:new{ text = text, timeout = 3 })
     end
 end
 
@@ -3551,6 +3691,7 @@ function ReadwiseReader:synchronize()
     -- Being here means we're online and configured, so this is also a good
     -- moment to retry any links queued while offline.
     self:flushPendingLinkSaves(false)
+    self:flushPendingTagUpdates(false)
 
     local sync_start_time = os.date("!%Y-%m-%dT%H:%M:%SZ")
     
@@ -3782,6 +3923,7 @@ function ReadwiseReader:saveSettings()
         progress_state = self.progress_state,
         pending_progress_seeds = self.pending_progress_seeds,
         pending_link_saves = self.pending_link_saves,
+        pending_tag_updates = self.pending_tag_updates,
         reader_placement_since = self.reader_placement_since,
         reader_highlight_records = self.reader_highlight_records,
     }

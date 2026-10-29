@@ -4,6 +4,20 @@ This fork continues from [tomtom800/readwisereader](https://github.com/tomtom800
 v2.6 (via [Endle/readwisereader](https://github.com/Endle/readwisereader)). Versions start at
 3.0.0 so they never collide with upstream release numbers.
 
+## [Unreleased]
+
+### Added
+- **Edit tags** on a Reader document: hold a document in Browse Reader, Search Library or a view,
+  then choose **Edit tags**. A full-screen picker lists every tag in your account; tap to tick or
+  untick, or add a new one. The current tags are fetched fresh first, because Reader replaces the
+  whole tag list on save and a tag added elsewhere must not be dropped.
+- Offline tag edits are kept on the device and sent at the next sync, when the network returns, or
+  from **Advanced sync → Send queued tag changes**. A queued edit is stored as "added / removed"
+  and re-applied on top of the tags Reader has by then.
+- After a tag edit, the tags in KOReader's Book Info keywords for an already-downloaded article are
+  updated too.
+- **Edit tags on a highlight** from the on-device highlights viewer (online only).
+
 ## [3.1.0] - 2026-10-28
 
 ### Added

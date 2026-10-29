@@ -1,8 +1,10 @@
 -- Reusable, text-first Reader document browser. Metadata pages stay in memory
 -- only for the current menu session. Tap toggles selection; hold shows details.
+local ButtonDialog = require("ui/widget/buttondialog")
 local ConfirmBox = require("ui/widget/confirmbox")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
+local TagPicker = require("ui/tagpicker")
 local Trapper = require("ui/trapper")
 local UIManager = require("ui/uimanager")
 
@@ -93,6 +95,9 @@ function Browser:new(options)
         selected = {},
         search = nil,
         link_local_book = options.link_local_book,
+        known_tags = options.known_tags,
+        queue_tag_update = options.queue_tag_update,
+        on_tags_changed = options.on_tags_changed,
         link_search = nil,
     }, self)
 end
@@ -463,18 +468,121 @@ function Browser:download(document_list, menu)
 end
 
 function Browser:showDocumentInfo(document, menu)
-    if self:getDownloadedLookup()[document.id] then
-        -- Direct file opening is intentionally omitted until the installed
-        -- KOReader build's supported API can be verified.
-        UIManager:show(InfoMessage:new{ text = self:formatDetails(document) })
+    local dialog
+    local function close() UIManager:close(dialog) end
+    local rows = {}
+    -- Direct file opening is intentionally omitted until the installed
+    -- KOReader build's supported API can be verified.
+    if not self:getDownloadedLookup()[document.id] then
+        table.insert(rows, {{
+            text = "Download",
+            callback = function()
+                close()
+                self:download({ document }, menu)
+            end,
+        }})
+    end
+    table.insert(rows, {{
+        text = "Edit tags",
+        callback = function()
+            close()
+            self:editTags(document, menu)
+        end,
+    }})
+    table.insert(rows, {{ text = "Close", callback = close }})
+    dialog = ButtonDialog:new{
+        title = self:formatDetails(document),
+        buttons = rows,
+    }
+    UIManager:show(dialog)
+end
+
+-- Tags are chosen in a picker. Reader replaces the whole list on save, so the
+-- current tags are fetched fresh first: a tag added on the web since this page
+-- loaded must not be silently dropped. Offline (or throttled) the picker still
+-- opens on the cached tags and the change is queued as a diff for the next
+-- sync, so it can be re-applied on top of whatever the tags are by then.
+function Browser:editTags(document, menu)
+    if self.is_configured and not self.is_configured() then
+        self:showError("Configure your Readwise access token before editing tags.")
         return
     end
-    UIManager:show(ConfirmBox:new{
-        text = self:formatDetails(document),
-        ok_text = "Download",
-        ok_callback = function()
-            self:download({ document }, menu)
+    if self.show_progress then self.show_progress("Loading tags…") end
+    local fresh, err, status = self.reader_api:getDocument(document.id, false)
+    local all_tags
+    if fresh then
+        document.tags = fresh.tags
+        all_tags = self.reader_api:listTags()
+    end
+    if self.hide_progress then self.hide_progress() end
+    if not fresh then
+        if not (self.queue_tag_update and self.reader_api.isRetryable(err, status)) then
+            self:showError(self:tagErrorText(err, status))
+            return
+        end
+        UIManager:show(InfoMessage:new{
+            text = "Offline: using the tags saved on this device. Changes will sync later.",
+            timeout = 3,
+        })
+    end
+    if not all_tags and self.known_tags then
+        all_tags = self.known_tags()
+    end
+    self:showTagsDialog(document, menu, document.tags or {}, all_tags or {})
+end
+
+function Browser:tagErrorText(err, status)
+    if err == "network_error" then
+        return "Editing tags requires a network connection."
+    end
+    if status == 401 or status == 403 then
+        return "Reader authentication failed. Check your Readwise access token."
+    end
+    return "Could not update tags. Please check your connection and try again."
+end
+
+function Browser:showTagsDialog(document, menu, current, all_tags)
+    TagPicker.show{
+        title = "Tags: " .. (document.title or "Untitled"),
+        all_tags = all_tags,
+        selected = current,
+        parse = self.reader_api.parseTags,
+        on_save = function(tags)
+            self:saveTags(document, current, tags, menu)
         end,
+    }
+end
+
+function Browser:saveTags(document, previous, tags, menu)
+    local add, remove = self.reader_api.diffTags(previous, tags)
+    if #add == 0 and #remove == 0 then
+        return
+    end
+    if self.show_progress then self.show_progress("Saving tags…") end
+    local saved, err, status = self.reader_api:updateTags(document.id, tags)
+    if self.hide_progress then self.hide_progress() end
+
+    if not saved then
+        if self.queue_tag_update and self.reader_api.isRetryable(err, status) then
+            self.queue_tag_update(document.id, add, remove)
+            document.tags = #tags > 0 and tags or nil
+            if menu then menu:updateItems() end
+            UIManager:show(InfoMessage:new{
+                text = "Couldn't reach Readwise. The tag change is saved here and will sync later.",
+                timeout = 4,
+            })
+        else
+            self:showError(self:tagErrorText(err, status))
+        end
+        return
+    end
+
+    document.tags = #saved > 0 and saved or nil
+    if self.on_tags_changed then self.on_tags_changed(document, saved) end
+    if menu then menu:updateItems() end
+    UIManager:show(InfoMessage:new{
+        text = #saved > 0 and ("Tags saved: " .. table.concat(saved, ", ")) or "All tags removed.",
+        timeout = 3,
     })
 end
 

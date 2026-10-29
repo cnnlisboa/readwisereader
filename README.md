@@ -40,6 +40,7 @@ A plugin for KOReader integration with the highlight saving and read later servi
 Everything here works on metadata only, so it is quick and light on memory. Nothing downloads until you ask for it.
 
 - **Readwise Reader → Browse Reader** lists Inbox, Later or Shortlist. Tap an article to select it, open its details if you want the summary, then choose **Download selected**. Use **Load more** for the next page and **Refresh list** to fetch it again.
+- Hold any document in the Reader browser and choose **Edit tags** to change its tags in Readwise Reader with a tag picker. If you are offline, the change is kept and sent at the next sync. In the Highlights viewer, **Edit tags** changes a highlight's tags (online only).
 - **Readwise Reader → Search Library** searches titles, authors, sites, summaries and tags across Inbox, Later, Shortlist, Archive and Feed. Reader's API has no search, so the plugin scans one page at a time; choose **Search next page** to keep going.
 - **Readwise Reader → Views** offers Quick Reads (5 minutes or less), Long Reads (20 minutes or more) and In Progress. These scan Inbox, Later, Shortlist and Archive, not Feed.
 - Podcasts and audiobooks never appear, because Reader only provides their show notes. Videos (YouTube transcripts) appear unless you turn off **Settings → Show videos when browsing**.

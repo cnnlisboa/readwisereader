@@ -132,7 +132,7 @@ References: [DocSettings custom-cover code](https://github.com/koreader/koreader
 | Archive | Supported by current code | PATCH location to `archive`. |
 | Move Inbox/Later/Shortlist/Archive | Official API, partly constrained | UPDATE documents `new`, `later`, `archive`, `feed`; shortlist is listable but not documented as writable. |
 | Mark seen/unseen | Official API, not implemented | PATCH `seen`; it is boolean. |
-| Tags and notes | Official API, not implemented | PATCH replaces tags and a top-level note; notes do not apply to highlights. |
+| Tags and notes | Document tags implemented: the picker reads `GET /tags/`, fetches the document fresh, and PATCHes the full list; offline edits queue as add/remove diffs (`pending_tag_updates`) and are re-applied to the current tags at sync. Highlight tags use v2 `POST/DELETE /highlights/<id>/tags/` (online only). Notes not implemented |
 | Highlights Kindle to Readwise | Supported by current code | v2 highlights export; no Reader-document link is created. |
 | Highlights Readwise to Kindle | Requires experimentation/private API | No reliable source-location mapping into generated HTML. |
 | Daily Digest | Requires experimentation/private API | No documented Reader API endpoint audited. |

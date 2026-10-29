@@ -152,5 +152,39 @@ check("review url", review.review_url, "https://readwise.io/reviews/99")
 check("review highlight count", #review.highlights, 1)
 check("review highlight carries its own title", review.highlights[1].title, "Some Book")
 
+print("\n== highlight tags ==")
+local tagged = HighlightsRead.normalizeHighlight({ id = 9, text = "t", tags = { { id = 5, name = "old" }, { id = 6, name = "" } } })
+check("keeps named tag records", #tagged.tag_records, 1)
+check("tag record keeps id and name", tagged.tag_records[1].id .. tagged.tag_records[1].name, "5old")
+check("no tags means empty list", #HighlightsRead.normalizeHighlight({ id = 1 }).tag_records, 0)
+
+local log = {}
+local tag_api = HighlightsRead:new{
+    request = function(endpoint, method, body)
+        table.insert(log, method .. " " .. endpoint)
+        if method == "GET" then
+            return { results = { { id = 5, name = "old" }, { id = 7, name = "Keep" } } }
+        end
+        if method == "POST" then return { id = 8, name = body.name } end
+        return true
+    end,
+}
+local result = tag_api:setHighlightTags(9, { "keep", "fresh" })
+check("reads current tags first", log[1], "GET /highlights/9/tags/")
+check("deletes only the dropped tag", log[2], "DELETE /highlights/9/tags/5/")
+check("creates only the new tag", log[3], "POST /highlights/9/tags/")
+check("no other calls (case-insensitive keep)", #log, 3)
+check("returns the resulting tags", result[1].name .. "|" .. result[2].name, "Keep|fresh")
+check("new tag record carries its id", result[2].id, 8)
+
+local failing = HighlightsRead:new{
+    request = function(_, method)
+        if method == "GET" then return { results = {} } end
+        return nil, "network_error"
+    end,
+}
+local _, tag_err = failing:setHighlightTags(9, { "x" })
+check("failure while adding is reported", tag_err, "network_error")
+
 print(failures == 0 and "\nALL PASS" or string.format("\n%d FAILURES", failures))
 os.exit(failures == 0 and 0 or 1)

@@ -13,6 +13,20 @@ local function stringOrNil(value)
     return type(value) == "string" and value ~= "" and value or nil
 end
 
+-- v2 returns a highlight's tags as {id, name} objects. Names are what the UI
+-- shows; ids are needed to delete one, so both are kept.
+local function normalizeTagRecords(tags)
+    local records = {}
+    if type(tags) == "table" then
+        for _, tag in ipairs(tags) do
+            if type(tag) == "table" and type(tag.name) == "string" and tag.name ~= "" then
+                table.insert(records, { id = tag.id, name = tag.name })
+            end
+        end
+    end
+    return records
+end
+
 function HighlightsRead:new(options)
     assert(type(options) == "table" and type(options.request) == "function",
         "HighlightsRead request adapter required")
@@ -37,6 +51,7 @@ function HighlightsRead.normalizeHighlight(highlight)
         title = stringOrNil(highlight.title),
         author = stringOrNil(highlight.author),
         source_url = stringOrNil(highlight.source_url),
+        tag_records = normalizeTagRecords(highlight.tags),
     }
 end
 
@@ -200,6 +215,60 @@ function HighlightsRead:dailyReview()
         review_id = response.review_id,
         review_url = stringOrNil(response.review_url),
     }
+end
+
+-- GET /highlights/<id>/tags/ -- the highlight's current tags, fetched fresh
+-- before an edit so a tag added elsewhere is not mistaken for a removal.
+function HighlightsRead:getHighlightTags(highlight_id)
+    if highlight_id == nil then
+        return nil, "missing_highlight_id"
+    end
+    local response, err, status = self.request("/highlights/" .. tostring(highlight_id) .. "/tags/", "GET", nil)
+    if not response then
+        return nil, err or "request_failed", status
+    end
+    return normalizeTagRecords(response.results)
+end
+
+-- Unlike Reader documents, v2 tags are added and removed one at a time
+-- (POST /highlights/<id>/tags/ {name}, DELETE .../tags/<tag_id>/), so this
+-- diffs against the fresh list and applies only the difference. Stops at the
+-- first failure and returns the tags as they now stand.
+function HighlightsRead:setHighlightTags(highlight_id, desired)
+    local records, err, status = self:getHighlightTags(highlight_id)
+    if not records then
+        return nil, err, status
+    end
+    local wanted = {}
+    for _, name in ipairs(desired) do wanted[name:lower()] = true end
+    local present = {}
+    for _, record in ipairs(records) do present[record.name:lower()] = true end
+
+    local base = "/highlights/" .. tostring(highlight_id) .. "/tags/"
+    local remaining = {}
+    for _, record in ipairs(records) do
+        if wanted[record.name:lower()] then
+            table.insert(remaining, record)
+        else
+            local ok, delete_err, delete_status = self.request(base .. tostring(record.id) .. "/", "DELETE", nil)
+            if not ok then
+                return nil, delete_err or "request_failed", delete_status
+            end
+        end
+    end
+    for _, name in ipairs(desired) do
+        if not present[name:lower()] then
+            local created, create_err, create_status = self.request(base, "POST", { name = name })
+            if not created then
+                return nil, create_err or "request_failed", create_status
+            end
+            table.insert(remaining, {
+                id = type(created) == "table" and created.id or nil,
+                name = name,
+            })
+        end
+    end
+    return remaining
 end
 
 return HighlightsRead

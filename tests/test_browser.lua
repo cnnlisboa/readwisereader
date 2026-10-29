@@ -5,11 +5,26 @@ package.path = (os.getenv("PLUGIN_PATH") or "readwisereader.koplugin") .. "/?.lu
 local function widget()
     return { new = function(_, o) return o end }
 end
+package.preload["ui/widget/buttondialog"] = widget
 package.preload["ui/widget/confirmbox"] = widget
 package.preload["ui/widget/infomessage"] = widget
 package.preload["ui/widget/inputdialog"] = widget
+package.preload["ui/widget/menu"] = function()
+    return {
+        new = function(_, o)
+            o.switchItemTable = function(self, _, items) self.item_table = items end
+            return o
+        end,
+    }
+end
 package.preload["ui/trapper"] = function() return {} end
-package.preload["ui/uimanager"] = function() return { show = function() end } end
+local shown = {}
+package.preload["ui/uimanager"] = function()
+    return {
+        show = function(_, w) table.insert(shown, w) end,
+        close = function() end,
+    }
+end
 
 local Browser = require("ui/browser")
 
@@ -120,6 +135,114 @@ do
 
     browser:getLocationItems()[1].sub_item_table_func()[1].callback(nil)
     check("select all skips hidden", browser:selectionCount(), 1)
+end
+
+-- Edit tags: fetch fresh, pick, save; queue when the save cannot reach Reader.
+do
+    local Reader = require("api/reader")
+    local function tagBrowser(overrides)
+        local state = { saved = nil, queued = nil, changed = nil, fetched = 0 }
+        local api = {
+            parseTags = Reader.parseTags,
+            diffTags = Reader.diffTags,
+            isRetryable = Reader.isRetryable,
+            getDocument = overrides.getDocument or function()
+                state.fetched = state.fetched + 1
+                return { id = "d1", tags = { "fresh", "web-added" } }
+            end,
+            listTags = overrides.listTags or function() return { "fresh", "web-added", "other" } end,
+            updateTags = overrides.updateTags or function(_, id, tags)
+                state.saved = { id = id, tags = tags }
+                return tags
+            end,
+        }
+        local browser = Browser:new{
+            reader_api = api,
+            downloaded_ids = function() return {} end,
+            download_documents = function() end,
+            known_tags = function() return { "cached-known" } end,
+            queue_tag_update = function(id, add, remove) state.queued = { id = id, add = add, remove = remove } end,
+            on_tags_changed = function(document, tags) state.changed = { id = document.id, tags = tags } end,
+        }
+        return browser, state
+    end
+    local function rowTexts(menu)
+        local texts = {}
+        for _, item in ipairs(menu.item_table) do table.insert(texts, item.text) end
+        return table.concat(texts, "|")
+    end
+    local function tap(menu, prefix)
+        for _, item in ipairs(menu.item_table) do
+            if item.text:sub(1, #prefix) == prefix then return item.callback() end
+        end
+        error("no row " .. prefix)
+    end
+
+    -- Online: picker shows every account tag with current ones ticked.
+    local doc = { id = "d1", title = "Doc", tags = { "stale" } }
+    local browser, state = tagBrowser{}
+    shown = {}
+    browser:showDocumentInfo(doc, nil)
+    local details = shown[#shown]
+    check("details offer Download", details.buttons[1][1].text, "Download")
+    check("details offer Edit tags", details.buttons[2][1].text, "Edit tags")
+    details.buttons[2][1].callback()
+    local picker = shown[#shown]
+    check("fetched fresh tags first", state.fetched, 1)
+    check("picker lists all tags, fresh ones ticked",
+        rowTexts(picker), "Save (2 selected)|+ New tag…|[x] fresh|[ ] other|[x] web-added")
+    tap(picker, "[ ] other")
+    tap(picker, "[x] web-added")
+    tap(picker, "Save")
+    check("save sends the picked list", table.concat(state.saved.tags, "|"), "fresh|other")
+    check("local sync hook told the new tags", table.concat(state.changed.tags, "|"), "fresh|other")
+    check("document tags updated in memory", table.concat(doc.tags, "|"), "fresh|other")
+
+    -- Saving without changes sends nothing.
+    local noop_browser, noop_state = tagBrowser{}
+    shown = {}
+    noop_browser:editTags({ id = "d1", title = "Doc" }, nil)
+    tap(shown[#shown], "Save")
+    check("unchanged save sends nothing", noop_state.saved, nil)
+
+    -- Offline from the start: cached tags, change queued as a diff.
+    local offline_doc = { id = "d1", title = "Doc", tags = { "keep", "drop" } }
+    local offline, offline_state = tagBrowser{
+        getDocument = function() return nil, "network_error" end,
+        listTags = function() return nil, "network_error" end,
+        updateTags = function() return nil, "network_error" end,
+    }
+    shown = {}
+    offline:editTags(offline_doc, nil)
+    local offline_picker = shown[#shown]
+    check("offline picker opens on cached tags", rowTexts(offline_picker),
+        "Save (2 selected)|+ New tag…|[ ] cached-known|[x] drop|[x] keep")
+    tap(offline_picker, "[x] drop")
+    tap(offline_picker, "[ ] cached-known")
+    tap(offline_picker, "Save")
+    check("offline change queued for document", offline_state.queued.id, "d1")
+    check("queued diff adds", table.concat(offline_state.queued.add, "|"), "cached-known")
+    check("queued diff removes", table.concat(offline_state.queued.remove, "|"), "drop")
+    check("document shows the pending tags", table.concat(offline_doc.tags, "|"), "cached-known|keep")
+
+    -- A permanent failure is reported, not queued.
+    local denied, denied_state = tagBrowser{
+        updateTags = function() return nil, "http_error", 401 end,
+    }
+    shown = {}
+    denied:editTags({ id = "d1", title = "Doc" }, nil)
+    tap(shown[#shown], "[ ] other")
+    tap(shown[#shown], "Save")
+    check("auth failure is not queued", denied_state.queued, nil)
+
+    local downloaded = Browser:new{
+        reader_api = {},
+        downloaded_ids = function() return { d1 = true } end,
+        download_documents = function() end,
+    }
+    shown = {}
+    downloaded:showDocumentInfo(doc, nil)
+    check("downloaded details skip Download", shown[#shown].buttons[1][1].text, "Edit tags")
 end
 
 if failures > 0 then

@@ -13,6 +13,7 @@
 -- back to a plain InfoMessage instead of crashing the menu.
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
+local TagPicker = require("ui/tagpicker")
 local TextViewer = require("ui/widget/textviewer")
 local UIManager = require("ui/uimanager")
 local Screen = require("device").screen
@@ -53,6 +54,8 @@ function HighlightsBrowser:new(options)
         is_configured = options.is_configured,
         show_progress = options.show_progress,
         hide_progress = options.hide_progress,
+        known_tags = options.known_tags,
+        parse_tags = options.parse_tags,
         search = nil,
         daily_review = nil,
         category_books = {},
@@ -375,6 +378,12 @@ function HighlightsBrowser:formatHighlightBody(highlight, context)
         table.insert(lines, "")
         table.insert(lines, "Note: " .. highlight.note)
     end
+    if highlight.tag_records and #highlight.tag_records > 0 then
+        local names = {}
+        for _, record in ipairs(highlight.tag_records) do table.insert(names, record.name) end
+        table.insert(lines, "")
+        table.insert(lines, "Tags: " .. table.concat(names, ", "))
+    end
     if highlight.highlighted_at then
         table.insert(lines, "")
         table.insert(lines, "Highlighted: " .. highlight.highlighted_at)
@@ -425,6 +434,14 @@ function HighlightsBrowser:showHighlightViewer(context, index)
     if #nav_row > 0 then
         table.insert(buttons, nav_row)
     end
+    table.insert(buttons, {
+        {
+            text = "Edit tags",
+            callback = function()
+                self:editTags(context, index)
+            end,
+        },
+    })
     if context.show_view_all and highlight.book_id then
         table.insert(buttons, {
             {
@@ -465,6 +482,56 @@ function HighlightsBrowser:showHighlightViewer(context, index)
         logger.warn("ReadwiseReader:showHighlightViewer: TextViewer construction failed, falling back", viewer)
         UIManager:show(InfoMessage:new{ text = title .. "\n\n" .. text })
     end
+end
+
+-- Tags ----------------------------------------------------------------------
+
+function HighlightsBrowser:tagErrorText(err, status)
+    if err == "network_error" then
+        return "Editing tags requires a network connection."
+    end
+    if status == 401 or status == 403 then
+        return "Readwise authentication failed. Check your access token."
+    end
+    return "Could not update tags. Please check your connection and try again."
+end
+
+-- Highlight tags are edited online only: they are changed one tag at a time on
+-- the server, so there is no whole-list replace to queue and re-apply later.
+function HighlightsBrowser:editTags(context, index)
+    local highlight = context.items[index]
+    if self.is_configured and not self.is_configured() then
+        self:showError("Configure your Readwise access token before editing tags.")
+        return
+    end
+    self.show_progress("Loading tags…")
+    local records, err, status = self.highlights_api:getHighlightTags(highlight.id)
+    local all_tags = records and self.known_tags and self.known_tags() or {}
+    self.hide_progress()
+    if not records then
+        self:showError(self:tagErrorText(err, status))
+        return
+    end
+    local current = {}
+    for _, record in ipairs(records) do table.insert(current, record.name) end
+
+    TagPicker.show{
+        title = "Highlight tags",
+        all_tags = all_tags,
+        selected = current,
+        parse = self.parse_tags,
+        on_save = function(tags)
+            self.show_progress("Saving tags…")
+            local saved, save_err, save_status = self.highlights_api:setHighlightTags(highlight.id, tags)
+            self.hide_progress()
+            if not saved then
+                self:showError(self:tagErrorText(save_err, save_status))
+                return
+            end
+            highlight.tag_records = saved
+            self:showHighlightViewer(context, index)
+        end,
+    }
 end
 
 -- Search ------------------------------------------------------------------

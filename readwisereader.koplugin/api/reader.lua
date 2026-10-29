@@ -76,6 +76,143 @@ function Reader.normalizeDocument(document)
     }
 end
 
+-- Turns what a user typed ("a, b,, A") into a clean tag list: split on commas
+-- or newlines, trimmed, empties dropped, and case-insensitive duplicates
+-- collapsed (the first spelling wins), keeping the order given.
+function Reader.parseTags(text)
+    local tags, seen = {}, {}
+    if type(text) ~= "string" then
+        return tags
+    end
+    for piece in text:gmatch("[^,\n]+") do
+        local name = piece:match("^%s*(.-)%s*$")
+        local key = name:lower()
+        if name ~= "" and not seen[key] then
+            seen[key] = true
+            table.insert(tags, name)
+        end
+    end
+    return tags
+end
+
+-- PATCH /update/<id>/ REPLACES the document's whole tag list, so callers must
+-- pass the complete list they want it to end up with (an empty list clears all
+-- tags). Returns the normalized list that was sent.
+function Reader:updateTags(document_id, tags)
+    if type(document_id) ~= "string" or document_id == "" then
+        return nil, "invalid_document"
+    end
+    if type(tags) ~= "table" then
+        return nil, "invalid_tags"
+    end
+    local payload = Reader.parseTags(table.concat(tags, ","))
+    local response, err, status = self.request("PATCH", "/update/" .. queryEscape(document_id) .. "/", {
+        tags = payload,
+    })
+    if not response then
+        return nil, err or "request_failed", status
+    end
+    return payload
+end
+
+local function lowerSet(tags)
+    local set = {}
+    for _, tag in ipairs(tags or {}) do
+        set[tag:lower()] = true
+    end
+    return set
+end
+
+-- What changed between two tag lists, compared case-insensitively. Queued
+-- edits store this instead of the full list: Reader replaces the whole list on
+-- save, so a diff can be re-applied to whatever the tags are by the time the
+-- device is back online without undoing changes made elsewhere in between.
+function Reader.diffTags(old_tags, new_tags)
+    local had, has = lowerSet(old_tags), lowerSet(new_tags)
+    local add, remove = {}, {}
+    for _, tag in ipairs(new_tags or {}) do
+        if not had[tag:lower()] then table.insert(add, tag) end
+    end
+    for _, tag in ipairs(old_tags or {}) do
+        if not has[tag:lower()] then table.insert(remove, tag) end
+    end
+    return add, remove
+end
+
+function Reader.applyTagDiff(tags, add, remove)
+    local removed = lowerSet(remove)
+    local result = {}
+    for _, tag in ipairs(tags or {}) do
+        if not removed[tag:lower()] then table.insert(result, tag) end
+    end
+    for _, tag in ipairs(add or {}) do
+        table.insert(result, tag)
+    end
+    return Reader.parseTags(table.concat(result, ","))
+end
+
+-- Folds a newer edit into an older queued one for the same document: the
+-- newer edit wins wherever the two disagree about a tag.
+function Reader.mergeTagDiffs(older, newer)
+    local newer_add, newer_remove = lowerSet(newer.add), lowerSet(newer.remove)
+    local add, remove = {}, {}
+    for _, tag in ipairs(older.add or {}) do
+        if not newer_remove[tag:lower()] then table.insert(add, tag) end
+    end
+    for _, tag in ipairs(newer.add or {}) do table.insert(add, tag) end
+    for _, tag in ipairs(older.remove or {}) do
+        if not newer_add[tag:lower()] then table.insert(remove, tag) end
+    end
+    for _, tag in ipairs(newer.remove or {}) do table.insert(remove, tag) end
+    return { add = Reader.parseTags(table.concat(add, ",")), remove = Reader.parseTags(table.concat(remove, ",")) }
+end
+
+-- A failure worth retrying later (offline, throttled, server trouble) as
+-- opposed to one a retry cannot fix (bad token, document gone).
+function Reader.isRetryable(err, status)
+    return err == "network_error" or status == 429 or (type(status) == "number" and status >= 500)
+end
+
+-- GET /tags/ -- every tag name in the account, for the tag picker. Bounded to a
+-- few pages so a huge tag set cannot stall the device.
+function Reader:listTags()
+    local names, seen, cursor = {}, {}, nil
+    for _ = 1, 10 do
+        local endpoint = "/tags/"
+        if cursor then endpoint = endpoint .. "?pageCursor=" .. queryEscape(cursor) end
+        local response, err, status = self.request("GET", endpoint)
+        if not response then
+            return nil, err or "request_failed", status
+        end
+        for _, tag in ipairs(normalizeTags(response.results) or {}) do
+            if not seen[tag:lower()] then
+                seen[tag:lower()] = true
+                table.insert(names, tag)
+            end
+        end
+        cursor = stringOrNil(response.nextPageCursor)
+        if not cursor then break end
+    end
+    table.sort(names, function(a, b) return a:lower() < b:lower() end)
+    return names
+end
+
+-- Re-applies a queued tag diff to the document's CURRENT tags. Returns the
+-- fresh document (with its new tags) so callers can refresh local metadata.
+function Reader:applyTagChange(document_id, add, remove)
+    local document, err, status = self:getDocument(document_id, false)
+    if not document then
+        return nil, err, status
+    end
+    local tags = Reader.applyTagDiff(document.tags, add, remove)
+    local saved, update_err, update_status = self:updateTags(document_id, tags)
+    if not saved then
+        return nil, update_err, update_status
+    end
+    document.tags = #saved > 0 and saved or nil
+    return document
+end
+
 function Reader:listMetadata(location, cursor)
     local endpoint = "/list/?withHtmlContent=false&withTags=true&limit=" .. PAGE_SIZE
     if type(location) == "string" and location ~= "" then
