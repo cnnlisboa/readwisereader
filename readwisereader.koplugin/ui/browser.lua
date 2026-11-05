@@ -98,6 +98,7 @@ function Browser:new(options)
         known_tags = options.known_tags,
         queue_tag_update = options.queue_tag_update,
         on_tags_changed = options.on_tags_changed,
+        archive_document = options.archive_document,
         link_search = nil,
     }, self)
 end
@@ -489,12 +490,38 @@ function Browser:showDocumentInfo(document, menu)
             self:editTags(document, menu)
         end,
     }})
+    if self.archive_document and document.location ~= "archive" then
+        table.insert(rows, {{
+            text = "Archive",
+            callback = function()
+                close()
+                self:archive(document, menu)
+            end,
+        }})
+    end
     table.insert(rows, {{ text = "Close", callback = close }})
     dialog = ButtonDialog:new{
         title = self:formatDetails(document),
         buttons = rows,
     }
     UIManager:show(dialog)
+end
+
+function Browser:archive(document, menu)
+    if self.is_configured and not self.is_configured() then
+        self:showError("Configure your Readwise access token before archiving.")
+        return
+    end
+    if self.show_progress then self.show_progress("Archiving…") end
+    local done, message = self.archive_document(document)
+    if self.hide_progress then self.hide_progress() end
+    if done then
+        document.location = "archive"
+        if menu then menu:updateItems() end
+        UIManager:show(InfoMessage:new{ text = message, timeout = 3 })
+    else
+        self:showError(message)
+    end
 end
 
 -- Tags are chosen in a picker. Reader replaces the whole list on save, so the

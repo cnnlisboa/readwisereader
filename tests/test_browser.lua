@@ -245,6 +245,49 @@ do
     check("downloaded details skip Download", shown[#shown].buttons[1][1].text, "Edit tags")
 end
 
+-- Archive: offered for documents outside the Archive, reported either way.
+do
+    local archived_ids = {}
+    local result = { true, "Archived." }
+    local browser = Browser:new{
+        reader_api = {},
+        downloaded_ids = function() return {} end,
+        download_documents = function() end,
+        archive_document = function(document)
+            table.insert(archived_ids, document.id)
+            return result[1], result[2]
+        end,
+    }
+    local doc = { id = "a1", title = "Doc", location = "later" }
+    shown = {}
+    browser:showDocumentInfo(doc, nil)
+    local details = shown[#shown]
+    check("details offer Archive", details.buttons[3][1].text, "Archive")
+    details.buttons[3][1].callback()
+    check("archive callback gets the document", archived_ids[1], "a1")
+    check("archived document moves to Archive", doc.location, "archive")
+    check("success is reported", shown[#shown].text, "Archived.")
+
+    shown = {}
+    browser:showDocumentInfo(doc, nil)
+    check("archived documents have no Archive button", #shown[#shown].buttons, 3)
+
+    result = { false, "Could not archive." }
+    local other = { id = "a2", title = "Other", location = "new" }
+    browser:archive(other, nil)
+    check("failure keeps the location", other.location, "new")
+    check("failure is reported", shown[#shown].text, "Could not archive.")
+
+    local without = Browser:new{
+        reader_api = {},
+        downloaded_ids = function() return {} end,
+        download_documents = function() end,
+    }
+    shown = {}
+    without:showDocumentInfo({ id = "a3", title = "X", location = "new" }, nil)
+    check("no Archive without a callback", #shown[#shown].buttons, 3)
+end
+
 if failures > 0 then
     print(failures .. " failure(s)")
     os.exit(1)

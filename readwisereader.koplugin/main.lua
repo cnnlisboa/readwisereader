@@ -280,6 +280,9 @@ function ReadwiseReader:init()
         on_tags_changed = function(document, tags)
             self:applyTagsLocally(document, tags)
         end,
+        archive_document = function(document)
+            return self:archiveFromBrowser(document)
+        end,
     }
     
     self.ui.menu:registerToMainMenu(self)
@@ -1045,21 +1048,33 @@ function ReadwiseReader:buildHighlightContext(booknotes)
 end
 
 -- Runs the highlight export pipeline. Returns the number of highlights Readwise
--- confirmed and, on a parse failure, the error -- the caller words that message,
--- since "continuing with article sync" is only true on the sync path.
-function ReadwiseReader:exportHighlights()
+-- confirmed, on a parse failure the error -- the caller words that message,
+-- since "continuing with article sync" is only true on the sync path -- and
+-- how many highlights failed to export. only_ids (Reader id -> true) limits
+-- the export to those downloaded articles, for removing one safely. Matched
+-- by id rather than path, since history may spell the path differently.
+function ReadwiseReader:exportHighlights(only_ids)
     self:showProgress("Exporting highlights to Readwise...")
 
     local success, clippings = pcall(function() return self:parseAllBooks() end)
     if not success then
         self:hideProgress()
         logger.warn("ReadwiseReader:exportHighlights: error parsing books for highlights:", clippings)
-        return 0, clippings
+        return 0, clippings, 0
+    end
+
+    if only_ids then
+        for title, booknotes in pairs(clippings) do
+            local doc_id = booknotes.file and self:getDocumentIdFromPath(booknotes.file)
+            if not (doc_id and only_ids[doc_id]) then
+                clippings[title] = nil
+            end
+        end
     end
 
     if next(clippings) == nil then
         self:hideProgress()
-        return 0, nil
+        return 0, nil, 0
     end
 
     local books = {}
@@ -1133,7 +1148,7 @@ function ReadwiseReader:exportHighlights()
     end
 
     self:hideProgress()
-    return report.confirmed + placement.placed + placement.updated, nil
+    return report.confirmed + placement.placed + placement.updated, nil, #report.failures
 end
 
 function ReadwiseReader:isDocReady()
@@ -2483,7 +2498,10 @@ end
 function ReadwiseReader:getDocumentList()
     local documents = {}
     local next_cursor = nil
-    
+    -- Shared across locations: once the cap is hit, later locations must not
+    -- add another article each before noticing.
+    local limit_reached = false
+
     local locations = {"new", "later", "shortlist"}
     
     for _, location in ipairs(locations) do
@@ -2502,7 +2520,6 @@ function ReadwiseReader:getDocumentList()
             logger.dbg("ReadwiseReader:getDocumentList: fetching documents from location:", location)
             next_cursor = nil
             local page_count = 0
-            local limit_reached = false
 
             repeat
                 page_count = page_count + 1
@@ -2559,8 +2576,11 @@ function ReadwiseReader:getDocumentList()
                 logger.dbg("ReadwiseReader:getDocumentList: processed page", page_count, "for location", location, ", next_cursor:", next_cursor)
             until not next_cursor or limit_reached
         end
+        if limit_reached then
+            break
+        end
     end
-    
+
     logger.dbg("ReadwiseReader:getDocumentList: total documents retrieved:", #documents)
     return documents
 end
@@ -2669,16 +2689,18 @@ function ReadwiseReader:deleteArchivedDocuments(targets)
 
     local deleted_count = 0
     for _, target in ipairs(targets) do
-        logger.dbg("ReadwiseReader:deleteArchivedDocuments: deleting locally archived document", target.id, target.filepath)
-        self:removeFromAllCollections(target.filepath)
-        -- Save collections immediately before deleting file to prevent orphaned references
-        self:saveCollections()
-        FileManager:deleteFile(target.filepath, true)
-        -- Remove metadata for archived documents
-        self:removeAuthorMetadata(target.id)
-        self:removeSourceUrlMetadata(target.id)
-        self:removeReaderMetadata(target.id)
-        deleted_count = deleted_count + 1
+        if self:highlightsSafeToRemove(target.filepath) then
+            logger.dbg("ReadwiseReader:deleteArchivedDocuments: deleting locally archived document", target.id, target.filepath)
+            self:removeFromAllCollections(target.filepath)
+            -- Save collections immediately before deleting file to prevent orphaned references
+            self:saveCollections()
+            FileManager:deleteFile(target.filepath, true)
+            -- Remove metadata for archived documents
+            self:removeAuthorMetadata(target.id)
+            self:removeSourceUrlMetadata(target.id)
+            self:removeReaderMetadata(target.id)
+            deleted_count = deleted_count + 1
+        end
     end
 
     logger.dbg("ReadwiseReader:deleteArchivedDocuments: deleted", deleted_count, "locally archived documents")
@@ -2691,6 +2713,101 @@ function ReadwiseReader:cleanupArchivedDocuments()
         return 0
     end
     return self:deleteArchivedDocuments(targets)
+end
+
+function ReadwiseReader:hasLocalHighlights(filepath)
+    if not DocSettings:hasSidecarFile(filepath) then
+        return false
+    end
+    local doc_settings = DocSettings:open(filepath)
+    for _, key in ipairs({ "annotations", "highlight", "bookmarks" }) do
+        local value = doc_settings:readSetting(key)
+        if type(value) == "table" and next(value) ~= nil then
+            return true
+        end
+    end
+    return false
+end
+
+-- Deleting a file deletes its sidecar, and with it any highlight not yet in
+-- Readwise. When highlights are exported at sync, a file with highlights is
+-- only removed once they have been exported: by this sync's full export, or
+-- else by an export of just this file. If that fails the file stays, and the
+-- removal is retried next sync.
+function ReadwiseReader:highlightsSafeToRemove(filepath)
+    if not self.export_highlights_at_sync then
+        return true
+    end
+    if self.sync_highlights_ok or not self:hasLocalHighlights(filepath) then
+        return true
+    end
+    local doc_id = self:getDocumentIdFromPath(filepath)
+    if not doc_id then
+        return true
+    end
+    local _count, err, failures = self:exportHighlights({ [doc_id] = true })
+    if err or (failures or 0) > 0 then
+        logger.warn("ReadwiseReader:highlightsSafeToRemove: keeping", filepath, "- highlight export failed", err)
+        self.removals_held = (self.removals_held or 0) + 1
+        return false
+    end
+    return true
+end
+
+-- Archive from the browser. Highlights are exported first (when export is on)
+-- because archiving drops the Reader metadata they are placed with; the local
+-- copy is removed unless it is open, in which case the next sync's archive
+-- cleanup takes it. Returns ok, message.
+function ReadwiseReader:archiveFromBrowser(document)
+    local filepath = self:findLocalDocumentByReadwiseId(document.id)
+    if filepath and not self:highlightsSafeToRemove(filepath) then
+        return false, "Could not export this article's highlights, so it was not archived. Try again later."
+    end
+    if not self:archiveDocument(document.id) then
+        return false, "Could not archive. Check your connection and try again."
+    end
+    if filepath and not self:isDocumentOpen(filepath) then
+        if not self.modified_collections then
+            self:initCollectionTracking()
+        end
+        self:removeFromAllCollections(filepath)
+        self:saveCollections()
+        FileManager:deleteFile(filepath, true)
+        self:removeAuthorMetadata(document.id)
+        self:removeSourceUrlMetadata(document.id)
+        self:removeReaderMetadata(document.id)
+        self:saveSettings()
+        if FileManager.instance then
+            FileManager.instance:onRefresh()
+        end
+        return true, "Archived and removed from this device."
+    end
+    return true, "Archived."
+end
+
+-- Book Info keywords for articles already on the device follow tag changes
+-- made in Reader. previous_tags is document_tags from before this sync's
+-- updateAvailableTags; only articles whose tag list changed are rewritten.
+function ReadwiseReader:refreshLocalTags(documents, previous_tags)
+    local local_paths = {}
+    self:forEachLocalDocument(function(doc_id, filepath)
+        local_paths[doc_id] = filepath
+    end)
+    local refreshed = 0
+    for _, doc in ipairs(documents) do
+        local filepath = local_paths[doc.id]
+        local before = previous_tags and previous_tags[doc.id] or {}
+        local after = self.document_tags[doc.id] or {}
+        if filepath and table.concat(before, "\n") ~= table.concat(after, "\n") then
+            local ok, err = pcall(function() self:setDocumentMetadata(filepath, doc) end)
+            if ok then
+                refreshed = refreshed + 1
+            else
+                logger.warn("ReadwiseReader:refreshLocalTags: could not update", filepath, err)
+            end
+        end
+    end
+    return refreshed
 end
 
 function ReadwiseReader:reconcileLocalDocuments(server_documents)
@@ -2707,7 +2824,7 @@ function ReadwiseReader:reconcileLocalDocuments(server_documents)
 
     -- Scan local directory for Readwise articles
     self:forEachLocalDocument(function(doc_id, filepath)
-        if not server_ids[doc_id] then
+        if not server_ids[doc_id] and self:highlightsSafeToRemove(filepath) then
             logger.dbg("ReadwiseReader:reconcileLocalDocuments: removing", filepath, "- no longer matches server state")
             FileManager:deleteFile(filepath, true)
             self:removeAuthorMetadata(doc_id)
@@ -3478,7 +3595,9 @@ function ReadwiseReader:processFinishedDocuments()
             local summary = doc_settings:readSetting("summary")
             local status = summary and summary.status
             
-            if status == "complete" then
+            -- Highlights go first: archiving drops the Reader metadata their
+            -- export is placed with.
+            if status == "complete" and self:highlightsSafeToRemove(filepath) then
                 if self:archiveDocument(doc_id) then
                     archived_count = archived_count + 1
                     FileManager:deleteFile(filepath, true)
@@ -3673,6 +3792,18 @@ function ReadwiseReader:synchronize()
         return
     end
 
+    -- sync_highlights_ok vouches for this sync's export only; a later manual
+    -- removal must check highlights again.
+    self.sync_highlights_ok = false
+    self.removals_held = 0
+    local ok, err = pcall(self.runSynchronize, self)
+    self.sync_highlights_ok = false
+    if not ok then
+        error(err, 0)
+    end
+end
+
+function ReadwiseReader:runSynchronize()
     local info = InfoMessage:new{ text = "Connecting to Readwise Reader…" }
     UIManager:show(info)
     
@@ -3698,8 +3829,9 @@ function ReadwiseReader:synchronize()
     -- Export highlights if enabled
     local highlights_exported = 0
     if self.export_highlights_at_sync then
-        local parse_err
-        highlights_exported, parse_err = self:exportHighlights()
+        local parse_err, export_failures
+        highlights_exported, parse_err, export_failures = self:exportHighlights()
+        self.sync_highlights_ok = not parse_err and export_failures == 0
         if parse_err then
             UIManager:show(InfoMessage:new{
                 text = string.format("Note: Highlight export failed, but continuing with article sync.\n%s",
@@ -3726,10 +3858,12 @@ function ReadwiseReader:synchronize()
         return
     end
     
+    local previous_tags = self.document_tags
     self:updateAvailableTags(documents)
 
     -- Remove local articles that no longer match server state
     local reconciled_count = self:reconcileLocalDocuments(documents)
+    self:refreshLocalTags(documents, previous_tags)
 
     -- Move already-downloaded articles forward when Reader was read elsewhere.
     -- Runs after reconciliation so a file about to be removed is never seeded.
@@ -3751,7 +3885,9 @@ function ReadwiseReader:synchronize()
         end
     end
 
-    if #filtered_documents == 0 and cleaned_count == 0 and archived_count == 0 and highlights_exported == 0 and reconciled_count == 0 then
+    local held_count = self.removals_held or 0
+    if #filtered_documents == 0 and cleaned_count == 0 and archived_count == 0 and highlights_exported == 0
+        and reconciled_count == 0 and held_count == 0 then
         local msg = "No new articles found and no changes to process."
         if existing_count > 0 then
             msg = msg .. "\n" .. string.format("Skipped %d existing articles.", existing_count)
@@ -3869,12 +4005,17 @@ function ReadwiseReader:synchronize()
         msg = msg .. "\n" .. string.format("Removed (no longer on server): %d", reconciled_count)
     end
 
+    if held_count > 0 then
+        msg = msg .. "\n" .. string.format(
+            "Kept until their highlights can be exported: %d", held_count)
+    end
+
     if archived_count > 0 then
         msg = msg .. "\n" .. string.format("Archived in Readwise: %d", archived_count)
         msg = msg .. "\n" .. string.format("Deleted locally: %d", deleted_count)
     end
     
-    if not cancelled and downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and reconciled_count == 0 and existing_count == 0 and highlights_exported == 0 then
+    if not cancelled and downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and reconciled_count == 0 and existing_count == 0 and highlights_exported == 0 and held_count == 0 then
         msg = msg .. "\n" .. "No changes to process."
     end
     

@@ -17,6 +17,18 @@ v2.6 (via [Endle/readwisereader](https://github.com/Endle/readwisereader)). Vers
 - After a tag edit, the tags in KOReader's Book Info keywords for an already-downloaded article are
   updated too.
 - **Edit tags on a highlight** from the on-device highlights viewer (online only).
+- **Archive** from Browse Reader, Search Library and views (hold a document). The local copy is
+  removed too, unless it is open; then the next sync removes it.
+- Tag changes made in Reader now update Book Info keywords for articles already on the device at
+  the next sync.
+
+### Changed
+- When highlights are exported at sync, an article with highlights is only removed (archived,
+  finished, or no longer in Reader) after its highlights have been exported. If they can't be, the
+  article stays until the next sync, and the sync summary says how many were kept.
+
+### Fixed
+- **Max articles per sync** could download one article more than the limit for each location.
 
 ## [3.1.0] - 2026-10-28
 
