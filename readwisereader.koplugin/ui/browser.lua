@@ -99,6 +99,7 @@ function Browser:new(options)
         queue_tag_update = options.queue_tag_update,
         on_tags_changed = options.on_tags_changed,
         archive_document = options.archive_document,
+        edit_note = options.edit_note,
         link_search = nil,
     }, self)
 end
@@ -483,13 +484,23 @@ function Browser:showDocumentInfo(document, menu)
             end,
         }})
     end
-    table.insert(rows, {{
+    local tags_row = {{
         text = "Edit tags",
         callback = function()
             close()
             self:editTags(document, menu)
         end,
-    }})
+    }}
+    if self.edit_note then
+        table.insert(tags_row, {
+            text = "Edit note",
+            callback = function()
+                close()
+                self.edit_note(document)
+            end,
+        })
+    end
+    table.insert(rows, tags_row)
     if self.archive_document and document.location ~= "archive" then
         table.insert(rows, {{
             text = "Archive",

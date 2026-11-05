@@ -18,6 +18,8 @@ Run them from the repository root with the same runtime KOReader ships:
     luajit tests/test_progress_note.lua
     luajit tests/test_reader.lua
     luajit tests/test_reader_highlights.lua
+    luajit tests/test_reader_note.lua
+    luajit tests/test_tag_filter.lua
 
 or all of them at once:
 

@@ -21,13 +21,45 @@ v2.6 (via [Endle/readwisereader](https://github.com/Endle/readwisereader)). Vers
   removed too, unless it is open; then the next sync removes it.
 - Tag changes made in Reader now update Book Info keywords for articles already on the device at
   the next sync.
+- **Reader tags and note for the open document**: **Readwise Reader → Reader tags for this
+  document** and **Reader note for this document**, for a downloaded article or a linked book. In
+  KOReader's library, hold the file and choose **Reader tags** or **Reader note**.
+- **Edit Reader notes.** Also from **Edit note** when holding a document in Browse Reader, Search
+  and views. The note opens in Writer Deck's editor when it is installed (and Writer Deck shows a
+  **Reader note** item and quote target for Reader documents), otherwise in KOReader's text box.
+  The note is read fresh before editing. If it changed in Reader meanwhile, you choose what to keep.
+  Offline edits start from the copy saved at the last sync and are sent later (**Advanced sync →
+  Send queued note changes**), keeping both versions if Reader's changed.
 
 ### Changed
+- **Reading position now syncs both ways** for downloaded articles and linked books, using the
+  `reading_progress` field Readwise Reader's API now accepts. The setting is renamed **Sync reading
+  position with Readwise Reader** (still off by default, existing choice kept). Opening a document
+  jumps to your Reader position if Reader is ahead; closing it or putting the device to sleep sends
+  your KOReader position if KOReader is ahead; each sync does both. The furthest position wins, so
+  neither side is moved backwards. Wi-Fi is never turned on for this. PDFs only receive Reader's
+  position, because Reader can't store one for them.
+- The check on opening waits until the book is on screen. If you've already turned a page by then,
+  it asks before jumping. Calls made while a book is open give up after a few seconds on a bad
+  connection instead of retrying.
+- **Finished articles are sent as 100%** read, and an article finished in Readwise Reader is marked
+  finished in KOReader at the next sync.
+- **An article finished in Readwise Reader is no longer deleted from the device** at the next sync.
+  It stays until it is archived. Turn off **Archive finished articles** to archive finished articles
+  only when you choose, with **Advanced sync → Archive finished articles on Readwise**.
+- **Linked book progress → Send KOReader progress to Reader** now sets the real Reader position
+  instead of writing a `KOReader progress: N%` line into the Reader note.
 - When highlights are exported at sync, an article with highlights is only removed (archived,
   finished, or no longer in Reader) after its highlights have been exported. If they can't be, the
   article stays until the next sync, and the sync summary says how many were kept.
 
+### Removed
+- **Remove KOReader progress from Reader note.** The first sync after upgrading strips those note
+  lines from linked books automatically, leaving the rest of each note untouched.
+
 ### Fixed
+- **Excluded tags and types** now apply in the same sync that brings an article in, and ignore case.
+  A new article with an excluded tag used to be downloaded and then removed a sync later.
 - **Max articles per sync** could download one article more than the limit for each location.
 
 ## [3.1.0] - 2026-10-28

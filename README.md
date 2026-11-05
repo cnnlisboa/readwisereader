@@ -11,9 +11,9 @@ A plugin for KOReader integration with the highlight saving and read later servi
 - Downloaded articles get Reader's cover image as their KOReader cover (can be turned off).
 - Articles in Readwise Reader saved to “Inbox”, “Later” or “Shortlist” are downloaded to KOReader as HTML files.
 - Images are downloaded where this is possible.
-- Articles which have been read in KOReader and marked as “finished” will be moved to the Readwise Reader Archive at the next sync, and deleted from KOReader.
+- Articles which have been read in KOReader and marked as “finished” will be moved to the Readwise Reader Archive at the next sync, and deleted from KOReader ("Archive finished articles", on by default). Turn that off to keep finished articles and archive them yourself with **Advanced sync → Archive finished articles on Readwise**. An article you finish in Readwise Reader stays on the device until it is archived.
 - At sync, articles which have been archived in Readwise Reader will be deleted from KOReader.
-- Particular types of article, locations and document tags can be excluded from syncing in the settings menu.
+- Particular types of article, locations and document tags can be excluded from syncing in the settings menu. Exclusions ignore case and apply to an article in the same sync that brings it in.
 - Optionally, the plugin will only sync articles tagged as 'koreader' in Readwise (off by default).
 - The number of articles downloaded per sync can be limited in the settings menu (default: unlimited).
 - Highlights and notes that are saved in KOReader are exported to Readwise in the same sync process (disabled by default - enable in the settings menu). 
@@ -21,7 +21,7 @@ A plugin for KOReader integration with the highlight saving and read later servi
 - A local book can be explicitly linked to one Reader book without downloading Reader HTML. Its highlights then export with that Reader book's saved metadata; the plugin never links books from a filename or title alone.
 - Tapping a link while reading adds a **Save to Readwise Later** option to KOReader's own external-link dialog (alongside Copy, Show QR code, and Open in browser), which saves the link to Reader's Later list. If there is no network connection, the link is queued and sent automatically the next time the network reconnects or a sync runs; queued links can also be sent manually from Advanced sync.
 - Downloads show a progress bar with how many articles are done, how many are left, how much has been downloaded so far, and a Cancel button. Cancelling keeps everything already downloaded and takes effect at the next article, so a large article with many images finishes fetching first.
-- Optionally, an article you have read further in Readwise Reader on another device will open at roughly that place in KOReader ("Start at Readwise Reader position", off by default). The position is approximate, and it only travels from Readwise Reader to KOReader - see Limitations below.
+- Optionally, your reading position is kept in step with Readwise Reader for downloaded articles and linked books ("Sync reading position with Readwise Reader", off by default). A couple of seconds after opening one, it jumps to your Reader position if you read further there (if you've already turned a page, it asks first). Closing it, or putting the device to sleep, sends your KOReader position to Reader if you read further in KOReader. Each sync does both for downloaded articles. Marking an article finished in KOReader sends it as 100% read, and an article finished in Readwise Reader is marked finished in KOReader at the next sync. The furthest position always wins, so neither side is ever moved backwards. This needs Wi-Fi to already be on; the plugin never turns it on, and the next sync catches up.
 - Very image heavy files will download, but may cause KOReader to crash if the file is very large and your ereader can’t cope with this. Due to the way images are saved and the limitations of HTML files, this is more of an issue than with EPUBs. To mitigate this, there is a setting to allow the user to cap the size of a file, after which further images are not downloaded. This is set to 10MB by default, but may be changed according to the limits of the user’s setup. There is also a toggle to turn off image downloads completely if required.
 
 ## Limitations and Known Issues:
@@ -29,10 +29,10 @@ A plugin for KOReader integration with the highlight saving and read later servi
 - **Placing highlights in Reader** works for downloaded Reader articles and explicitly linked local books, and only for highlights made after you installed the version that added it (see the [CHANGELOG](CHANGELOG.md)). Older highlights may already be in Readwise from earlier exports, so they keep exporting the old way rather than appearing twice. Reader places a highlight by finding its exact passage; if it can't (for example, the text differs slightly between KOReader and Reader), the highlight is exported the old way, without a position, and the sync tells you how many. After a highlight is placed, only note changes are sent: Reader's API can't change a highlight's text, and deleting a highlight in KOReader does not delete it in Reader.
 - Highlights in books with no Reader link are not anchored inside any Reader document. Readwise groups them by title, author, and source URL.
 - Highlights exported the old way (not placed in Reader) carry a stable `highlight_url` derived from the annotation's creation time, so editing a highlight in KOReader updates it in Readwise on the next sync instead of adding a second copy. Readwise documents this update path for a highlight's *text*; whether it also revises an already-uploaded note is unverified.
-- Native reading position only travels one way, from Readwise Reader to KOReader. Readwise Reader publishes how far through a document you are, but its API has no field for storing a position, so the manual KOReader-progress note is only a visible percentage mirror, not a native Reader position update (rechecked 2026-09-09; details in [ROADMAP.md](docs/ROADMAP.md)). Marking an article "finished" in KOReader still archives it in Readwise Reader. The position that is carried across is approximate, because Readwise Reader and KOReader lay the same article out differently.
+- Reading positions are approximate, because Readwise Reader and KOReader lay the same article out differently; differences under 2% are ignored. PDFs only receive Readwise Reader's position: Reader can't store one sent from KOReader for a PDF. Checking Reader on open and sending on close or sleep can pause KOReader for a moment, a few seconds at most on a bad connection.
 - Books and PDFs already on your ereader cannot be uploaded to Readwise Reader from KOReader. The Readwise Reader API accepts a URL or a block of HTML, but has no file upload; EPUBs and PDFs can only be added by dragging them into the Readwise Reader web app or sharing to it from a phone. Highlights you make in those books are still exported to Readwise as normal.
 - A local-book link is keyed to that file's exact device path. If you move, rename, or replace the file, link it again. A highlight record without a local file path (for example, an unmatched Kindle My Clippings entry) cannot use a local-book link.
-- **Linked book progress** is manual and one book at a time. Sending progress writes only a marked `KOReader progress: N%` line to the Reader document note, preserving other note text. Applying Reader progress moves the open KOReader book to Reader's percentage approximately; it does not create a continuous progress sync.
+- Older versions wrote a `KOReader progress: N%` line into linked books' Reader notes. The first sync after upgrading removes those lines and leaves the rest of each note alone.
 - I am not planning to add any options to style the documents. However there are lots of tweaks you can apply as a user - see [here](https://koreader.rocks/user_guide/#L1-customizingappearance). 
 
 ## Browse, search, and views
@@ -40,10 +40,26 @@ A plugin for KOReader integration with the highlight saving and read later servi
 Everything here works on metadata only, so it is quick and light on memory. Nothing downloads until you ask for it.
 
 - **Readwise Reader → Browse Reader** lists Inbox, Later or Shortlist. Tap an article to select it, open its details if you want the summary, then choose **Download selected**. Use **Load more** for the next page and **Refresh list** to fetch it again.
-- Hold any document in the Reader browser and choose **Edit tags** to change its tags in Readwise Reader with a tag picker. If you are offline, the change is kept and sent at the next sync. In the Highlights viewer, **Edit tags** changes a highlight's tags (online only).
+- Hold any document in the Reader browser and choose **Edit tags** to change its tags in Readwise Reader with a tag picker, or **Edit note** to edit its Reader note. If you are offline, the change is kept and sent at the next sync. In the Highlights viewer, **Edit tags** changes a highlight's tags (online only).
 - **Readwise Reader → Search Library** searches titles, authors, sites, summaries and tags across Inbox, Later, Shortlist, Archive and Feed. Reader's API has no search, so the plugin scans one page at a time; choose **Search next page** to keep going.
 - **Readwise Reader → Views** offers Quick Reads (5 minutes or less), Long Reads (20 minutes or more) and In Progress. These scan Inbox, Later, Shortlist and Archive, not Feed.
 - Podcasts and audiobooks never appear, because Reader only provides their show notes. Videos (YouTube transcripts) appear unless you turn off **Settings → Show videos when browsing**.
+
+## Tags and notes for the document you're reading
+
+For a downloaded article or a linked book:
+
+- **Readwise Reader → Reader tags for this document** opens the tag picker for the open document.
+- **Readwise Reader → Reader note for this document** edits its Readwise Reader note.
+- In KOReader's library, **hold the file** and choose **Reader tags** or **Reader note**.
+
+The note opens in the Writer Deck plugin's editor when that plugin is installed, otherwise in KOReader's full-screen text box. Writer Deck also gets a **Reader note** item in its own menu, and **Writer Deck: add to… → Reader note** for selected text, whenever the open document is in Reader.
+
+Reader replaces the whole note when it is saved, so the plugin starts from the note as it is in Reader:
+
+- Online, the note is read fresh. If it changed in Reader while you were editing, you choose: add yours to the end, replace with yours, or keep Reader's.
+- Offline, you edit the copy saved at the last sync, and the edit is sent at the next sync, when the network returns, or from **Advanced sync → Send queued note changes**. If Reader's note changed in the meantime, both are kept, with yours added under a "From KOReader:" line.
+- Offline with no saved copy (a linked book that was never synced), what you write is added to the end of the Reader note.
 
 ## Read your highlights
 
@@ -65,9 +81,10 @@ The filename is prefilled solely as a search suggestion. You always choose the t
 
 For a linked, open local book, choose **Readwise Reader → Linked book progress** to:
 
-- Send the current KOReader percentage to the Reader document note.
-- Apply the Reader percentage to the current KOReader book after confirmation.
-- Remove only the marked KOReader-progress line from the Reader note after confirmation.
+- Send the current KOReader position to Readwise Reader, even if Reader is further ahead (not for PDFs).
+- Apply the Reader position to the current KOReader book after confirmation.
+
+With **Sync reading position with Readwise Reader** on, this happens automatically.
 
 ## Installation:
 - Download `readwisereader-vX.Y.Z.zip` from the [latest release](https://github.com/cnnlisboa/readwisereader/releases/latest). Extract it.

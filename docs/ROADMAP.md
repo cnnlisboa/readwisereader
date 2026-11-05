@@ -60,9 +60,9 @@ See [the detailed Phase 1 plan](PHASE-1.md).
 
 ## Phase 3: reading workflow improvements
 
-- **Implemented, not Kindle-verified:** clearly-labelled approximate progress
-  mapping from Reader to the device, off by default under "Start at Readwise
-  Reader position". A document is moved only when Reader was opened since the
+- **Implemented, not Kindle-verified:** two-way approximate progress sync, off
+  by default under "Sync reading position with Readwise Reader" (2026-11-05:
+  device-to-Reader pushes on close, sleep and sync). Reader-to-device: A document is moved only when Reader was opened since the
   last check, is more than a 2% dead band ahead of the sidecar's
   `percent_finished`, and was opened in Reader more recently than the sidecar was
   written -- so a tie goes to the device and local reading is never overwritten.
@@ -95,13 +95,9 @@ See [the detailed Phase 1 plan](PHASE-1.md).
 - The v2 CREATE response returns each affected book with a `modified_highlights`
   array, which is the only trustworthy count of what actually landed.
 
-- **Reading position cannot be sent to Reader.** Verified 2026-08-31. Public
-  list data includes `reading_progress`, but UPDATE and `bulk_update` accept only
-  `title`, `author`, `summary`, `language`, `published_date`, `image_url`,
-  `seen`, `location`, `category`, `tags` and `notes`. There is no percentage,
-  position, offset or scroll field, and `seen` is boolean rather than a progress
-  substitute. Completion-to-archive remains the only device-to-Reader signal, so
-  progress support is Reader-to-device only.
+- **Reading position can now be sent to Reader** (resolved 2026-11-05).
+  UPDATE and `bulk_update` accept `reading_progress`, except for PDFs, so
+  progress sync is two-way; see ARCHITECTURE.md, Reading progress.
 - **Local files cannot be uploaded to Reader.** Verified 2026-08-31. `save`
   accepts `url` (required) and `html`; there is no file-upload field and no
   multipart endpoint. EPUB, PDF and Markdown upload is web-drag-drop and

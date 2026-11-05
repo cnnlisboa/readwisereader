@@ -104,6 +104,41 @@ local _, fail_err, fail_status = failing:updateTags("doc1", { "x" })
 check("updateTags passes through the error", fail_err, "network_error")
 check("updateTags passes through the status", fail_status, 503)
 
+print("\n== Reading progress update ==")
+local progress_sent
+local progress_api = Reader:new{
+    request = function(method, endpoint, body)
+        progress_sent = { method = method, endpoint = endpoint, body = body }
+        return { id = "doc 1" }
+    end,
+}
+check("updateReadingProgress returns the percent", progress_api:updateReadingProgress("doc 1", 0.42), 0.42)
+check("updateReadingProgress uses PATCH", progress_sent.method, "PATCH")
+check("updateReadingProgress escapes the id", progress_sent.endpoint, "/update/doc%201/")
+check("updateReadingProgress sends reading_progress", progress_sent.body.reading_progress, 0.42)
+check("notes are left alone by default", progress_sent.body.notes, nil)
+progress_api:updateReadingProgress("doc1", 0.5, "kept text")
+check("notes are sent when given", progress_sent.body.notes, "kept text")
+progress_api:updateReadingProgress("doc1", 0.5, "")
+check("an emptied note is still sent", progress_sent.body.notes, "")
+check("updateReadingProgress rejects a bad id", select(2, progress_api:updateReadingProgress("", 0.5)), "invalid_document")
+check("updateReadingProgress rejects > 1", select(2, progress_api:updateReadingProgress("d", 1.2)), "invalid_progress")
+check("updateReadingProgress rejects nil", select(2, progress_api:updateReadingProgress("d", nil)), "invalid_progress")
+local _, progress_err, progress_status = failing:updateReadingProgress("doc1", 0.5)
+check("updateReadingProgress passes through the error", progress_err, "network_error")
+check("updateReadingProgress passes through the status", progress_status, 503)
+
+print("\n== Document note update ==")
+check("updateNotes returns what it sent", progress_api:updateNotes("doc 1", "hello"), "hello")
+check("updateNotes uses PATCH", progress_sent.method, "PATCH")
+check("updateNotes escapes the id", progress_sent.endpoint, "/update/doc%201/")
+check("updateNotes sends only notes", progress_sent.body.notes, "hello")
+check("updateNotes sends no progress", progress_sent.body.reading_progress, nil)
+check("an empty note clears it", progress_api:updateNotes("d", ""), "")
+check("updateNotes rejects a bad id", select(2, progress_api:updateNotes("", "x")), "invalid_document")
+check("updateNotes rejects non-text", select(2, progress_api:updateNotes("d", nil)), "invalid_notes")
+check("updateNotes passes through the status", select(3, failing:updateNotes("d", "x")), 503)
+
 print("\n== Tag diffs, queue merging and the tag list ==")
 local add, remove = Reader.diffTags({ "A", "b" }, { "a", "c" })
 check("diffTags adds only new (case-insensitive)", table.concat(add, "|"), "c")

@@ -101,5 +101,52 @@ check("string progress is coerced",
 check("string local_percent is coerced",
     why(at_forty, { local_percent = "0.39" }), "within the dead band")
 
+print("\n== pushing the device position to Reader ==")
+local function push(local_percent, state)
+    local value, reason = P.decidePush(local_percent, state)
+    if value then return value end
+    return reason
+end
+check("no local percent", push(nil, {}), "no local progress")
+check("out of range local percent", push(1.5, {}), "no local progress")
+check("barely started", push(0.005, {}), "local progress is negligible")
+check("the very end is sent as 100%", push(1, {}), 1)
+check("marked finished is sent as 100%", push(0.4, { finished = true }), 1)
+check("finished without a percent is still sent", push(nil, { finished = true }), 1)
+check("finished is not resent", push(0.4, { finished = true, pushed_percent = 1 }), "already sent")
+check("Reader already at 100%", push(1, { remote_percent = 1 }), "Reader is not behind")
+check("finished beats a Reader position behind it", push(0.3, { finished = true, remote_percent = 0.8 }), 1)
+check("PDFs are never pushed", push(0.5, { category = "pdf" }), "Reader keeps no position for PDFs")
+check("nothing known pushes", push(0.5, {}), 0.5)
+check("nil state pushes", push(0.5, nil), 0.5)
+check("unchanged since the last push", push(0.51, { pushed_percent = 0.5 }), "already sent")
+check("moved since the last push", push(0.6, { pushed_percent = 0.5 }), 0.6)
+check("Reader further ahead is never overwritten", push(0.3, { remote_percent = 0.7 }), "Reader is not behind")
+check("Reader within the dead band", push(0.51, { remote_percent = 0.5 }), "Reader is not behind")
+check("device ahead of Reader pushes", push(0.6, { remote_percent = 0.4 }), 0.6)
+check("string local percent is coerced", push("0.6", { remote_percent = 0.4 }), 0.6)
+-- Round trip: once a pushed value is Reader's position, a pull at the same
+-- value is inside the dead band, so neither side moves again.
+check("pulled-back push is a no-op",
+    why({ reading_progress = 0.6, last_opened_at = "2026-08-30T00:00:00Z" }, { local_percent = 0.6 }),
+    "within the dead band")
+
+print("\n== finished in Reader ==")
+local function mark(remote, state)
+    local yes, reason = P.shouldMarkFinished(remote, state)
+    return yes and "MARK" or reason
+end
+local done_in_reader = { reading_progress = 1, last_opened_at = "2026-08-30T00:00:00Z" }
+check("finished in Reader is marked here", mark(done_in_reader, {}), "MARK")
+check("finished without an open date is marked", mark({ reading_progress = 1 }, {}), "MARK")
+check("unfinished in Reader is not", mark({ reading_progress = 0.9 }, {}), "not finished in Reader")
+check("no remote document", mark(nil, {}), "no remote document")
+check("already finished here", mark(done_in_reader, { local_finished = true }), "already finished here")
+check("only once per document", mark(done_in_reader, { marked_finished = true }), "already marked once")
+check("device read after Reader wins",
+    mark(done_in_reader, { sidecar_mtime = P.toEpoch("2026-08-31T00:00:00Z") }), "device read more recently")
+check("device read before Reader is marked",
+    mark(done_in_reader, { sidecar_mtime = P.toEpoch("2026-08-29T00:00:00Z") }), "MARK")
+
 print(failures == 0 and "\nALL PASS" or string.format("\n%d FAILURES", failures))
 os.exit(failures == 0 and 0 or 1)

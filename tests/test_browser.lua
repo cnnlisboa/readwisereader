@@ -288,6 +288,32 @@ do
     check("no Archive without a callback", #shown[#shown].buttons, 3)
 end
 
+-- Edit note sits beside Edit tags, only when the plugin provides it.
+do
+    local noted
+    local browser = Browser:new{
+        reader_api = {},
+        downloaded_ids = function() return {} end,
+        download_documents = function() end,
+        edit_note = function(document) noted = document.id end,
+    }
+    shown = {}
+    browser:showDocumentInfo({ id = "n1", title = "Doc", location = "new" }, nil)
+    local row = shown[#shown].buttons[2]
+    check("Edit note is next to Edit tags", row[2] and row[2].text, "Edit note")
+    row[2].callback()
+    check("Edit note gets the document", noted, "n1")
+
+    local plain = Browser:new{
+        reader_api = {},
+        downloaded_ids = function() return {} end,
+        download_documents = function() end,
+    }
+    shown = {}
+    plain:showDocumentInfo({ id = "n2", title = "Doc", location = "new" }, nil)
+    check("no Edit note without a callback", shown[#shown].buttons[2][2], nil)
+end
+
 if failures > 0 then
     print(failures .. " failure(s)")
     os.exit(1)

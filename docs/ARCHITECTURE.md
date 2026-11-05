@@ -80,17 +80,38 @@ message either way.
 
 ### Manual linked-book progress
 
-The **Linked book progress** submenu is manual and only available for the open
-local book with an explicit Reader link. Sending reads KOReader's existing
-`percent_finished` sidecar, fetches linked Reader metadata with HTML disabled,
-and replaces only a visible, HTML-comment-marked `KOReader progress: N%` line in its
-top-level `notes` field. It preserves the rest of the Reader note and removal
-is confirmed before patching the document.
+The **Linked book progress** submenu is only available for the open local
+book with an explicit Reader link. Sending reads KOReader's `percent_finished`
+sidecar, fetches linked Reader metadata with HTML disabled, and PATCHes
+`reading_progress` even when Reader is further ahead, because the user asked.
+PDFs are refused, since Reader stores no position for them. Applying the
+Reader percentage dispatches `GotoPercent` after confirmation. The automatic
+two-way path is described under [Reading progress](#reading-progress).
 
-Applying the Reader percentage fetches `reading_progress` and dispatches the
-existing `GotoPercent` event only after confirmation. It is deliberately not a
-background or bidirectional sync: Reader offers no progress write field, and
-the two readers paginate different renderings.
+### Reader tags and notes for local files
+
+`getReaderTarget(filepath)` maps a downloaded article (Reader id in the
+filename) or a linked book to `{ id, title }` with no I/O, so it can run on
+every library long-press (`registerFileDialogButtons`, through File Manager's
+`addFileDialogButtons`) and every time Writer Deck builds its menu
+(`readerNoteTarget`). Tags reuse the browser's `editTags` flow.
+
+Notes: Reader's UPDATE replaces `notes`, so every edit carries the note it
+started from (`base`). `library/reader_note.lua` decides what a save sends:
+the edit if Reader is unchanged since `base`, otherwise a conflict, answered
+by the user when online and by `ReaderNote.merge` (append the addition, or the
+whole edit under "From KOReader:") for queued edits. `document_notes` caches
+each local article's and linked book's note from the sync list for offline
+editing. Queued edits live in `pending_note_updates` and flush with the tag
+queue (sync, `onNetworkConnected`, Advanced sync).
+
+The editor is Writer Deck's when `ui.writer_deck.openExternal` exists: Writer
+Deck shows the text as an "external" note it never stores or exports and
+returns it through `on_save` when the editor is left, unless discarded.
+Otherwise a full-screen `InputDialog`. Neither plugin requires the other.
+
+Exclusions: `library/tag_filter.lua` matches excluded types and tags against
+the document's own tags from the current LIST page, ignoring case.
 
 The chief architectural debt is the concentration of transport, Reader mapping,
 settings, filesystem work, HTML/images, metadata, collections, highlights,
@@ -126,7 +147,7 @@ References: [DocSettings custom-cover code](https://github.com/koreader/koreader
 | Full HTML/content | Supported by current code | `withHtmlContent=true`; Phase 1 should request it only per selected download. |
 | Original URL | Supported by current code | `source_url` is written to fallback HTML and stored for highlight export. |
 | Reading progress retrieval | Supported by current code | List returns `reading_progress` (0-1) plus `first_opened_at`, `last_opened_at`, `saved_at`, and `last_moved_at`. `library/progress.lua` decides when to move the device; `percent_finished` and a `GotoPercent` event apply it. |
-| Reading progress update | Currently blocked | Verified 2026-08-31: UPDATE and `bulk_update` accept only `title`, `author`, `summary`, `language`, `published_date`, `image_url`, `seen`, `location`, `category`, `tags`, `notes`. No percentage, position, offset, or scroll field, and `seen` is boolean. Completion-to-archive stays the only device-to-Reader signal. |
+| Reading progress update | Supported by current code | Verified 2026-11-05: UPDATE and `bulk_update` accept `reading_progress` (0-1, the LIST scale), and Reader's apps open the document there. Not supported for PDFs. `Reader:updateReadingProgress` sends it; `Progress.decidePush` decides when. |
 | Local file upload to Reader | Not available | Verified 2026-08-31: `save` accepts `url` (required) and `html`, with no file-upload field and no multipart endpoint. EPUB/PDF/Markdown upload is web and mobile UI only, so a book already on the device cannot be pushed to Reader. |
 | Save a URL to Reader | Supported by current code | `POST /save/` with `url` and `location = "later"`. Verified 2026-09-16: the endpoint returns `201` (created) or `200` (document already existed); `callAPI` treats both as success. Exposed as "Save to Readwise Later" in the reader's external-link dialog. |
 | Archive | Supported by current code | PATCH location to `archive`. |
@@ -145,8 +166,8 @@ References: [DocSettings custom-cover code](https://github.com/koreader/koreader
 
 The public API documents token authentication, paginated list requests,
 optional HTML, `image_url`, metadata, `reading_progress`, update fields, tags,
-bulk update, and delete. It does not document progress-position writes, file
-uploads, Daily Digest, or search. See [Reader API](https://readwise.io/reader_api).
+bulk update (including `reading_progress`), and delete. It does not document
+file uploads, Daily Digest, or search. See [Reader API](https://readwise.io/reader_api).
 
 ## Download progress and cancellation
 
@@ -193,36 +214,73 @@ still reasons from the last complete sync.
 
 ## Reading progress
 
-Progress is one-way by necessity: Reader publishes `reading_progress` but offers
-no field to write a position to, so nothing is ever pushed back. The feature is
-off by default under `sync_reading_progress` and is presented as approximate,
-because Reader measures progress over its own rendering while KOReader paginates
-the HTML `processHtmlContent` generates.
+Progress travels both ways and the furthest position wins: each side is only
+ever moved forward, so the device and Reader cannot keep overwriting each
+other. The feature is off by default under `sync_reading_progress` and is
+presented as approximate, because Reader measures progress over its own
+rendering while KOReader paginates the HTML `processHtmlContent` generates.
+It covers downloaded articles (Reader id in the filename) and linked local
+books (`getReaderIdentity`).
 
-`library/progress.lua` holds the whole policy as a pure function so it can be
+`library/progress.lua` holds the whole policy as pure functions so it can be
 tested without KOReader, matching the `paths.lua` (pure, tested) and
 `covers.lua` (I/O, not tested) split. Sidecar reads and writes stay in
 `main.lua` beside the existing `DocSettings` completion code.
 
-`Progress.decide` seeds only when Reader's progress is between 1% and 100%, the
-document was opened in Reader since the previous check (`last_opened_at`),
-Reader is more than a 2% dead band ahead of the sidecar's `percent_finished`,
-and the sidecar's mtime is older than Reader's `last_opened_at`. That last rule
-makes the device win a tie, so reading on the Kindle is never overwritten by a
-stale Reader position. ISO 8601 values are parsed to epoch seconds rather than
-compared as strings, because they are also compared against filesystem mtimes
-and Reader is not contractually stable about fractional seconds or zone format.
+**Reader to device.** `Progress.decide` seeds only when Reader's progress is
+between 1% and 100%, the document was opened in Reader since the previous check
+(`last_opened_at`), Reader is more than a 2% dead band ahead of the sidecar's
+`percent_finished`, and the sidecar's mtime is older than Reader's
+`last_opened_at`. That last rule makes the device win a tie. ISO 8601 values
+are parsed to epoch seconds rather than compared as strings, because they are
+also compared against filesystem mtimes. Seeds are recorded by
+`downloadDocument` and by `reconcileReadingProgress` at sync, and applied in
+`onReaderReady` with a `GotoPercent` event (not the sidecar's `last_percent`,
+which `readerrolling` honours only when `last_xpointer` is absent). When no seed
+is pending, `onReaderReady` schedules `pullProgressOnOpen` two seconds later,
+after the first page is drawn. If already online it reads the document from
+Reader and jumps the same way. If the page changed since opening, it asks
+instead of moving the reader, and it does nothing if the book was closed
+meanwhile (`onCloseDocument` also unschedules it).
 
-Two paths record a seed: `downloadDocument` on a first download, and
-`reconcileReadingProgress` during sync for documents already on the device. Both
-only record; the jump happens in `onReaderReady`, which fires a `GotoPercent`
-event and clears the seed so it applies exactly once. `GotoPercent` is used
-rather than writing the sidecar's `last_percent` because `readerrolling` honours
-`last_percent` only when `last_xpointer` is absent, and marks that branch
-deprecated. `percent_finished` is still written at seed time so the File Manager
-shows Reader's figure before the document is opened. Because `saveSettings`
-flushes the entire settings table, the reconciliation pass mutates its maps in
-memory and writes once at the end.
+**Device to Reader.** `Progress.decidePush` sends the local percent only when
+it moved more than the dead band since this device's last push (checked with
+no network), Reader is more than the dead band behind, and it isn't a PDF. A
+document marked finished in KOReader (`summary.status == "complete"`) is sent
+as 1. Reader is
+read immediately before the write, so a position reached elsewhere is never
+overwritten. Pushes happen on `onCloseDocument` and `onSuspend` for the open
+document, and at sync for every downloaded article (the LIST row is the fresh
+read) and every linked book (`pushLinkedBooksProgress`). Nothing turns Wi-Fi
+on; offline reading is caught up at the next sync. Page turns are not a
+trigger: close, sleep and sync already cover how reading sessions end, without
+a network call every few pages.
+
+Calls made while a book is open (pull on open, push on close and sleep) run
+under `withFastRequests`: `callAPI` makes one attempt with 3 s connect and 6 s
+total timeouts and skips the sync rate-limit pacing. These calls block
+KOReader's UI thread, so this caps the freeze on a bad connection.
+
+**Finished documents.** `getDocumentList` returns documents at
+`reading_progress` 1 separately. They are never downloaded and don't count
+toward the per-sync limit, but they are part of the listed set for
+`reconcileLocalDocuments`, so a local copy is kept: finished is not archived.
+At sync, an article finished in Reader is marked finished locally once
+(`Progress.shouldMarkFinished`, recorded as `marked_finished`), unless the
+device read it more recently or it is open. Archiving and deleting stays with
+the "Archive finished articles" setting and the Advanced sync action.
+
+Per-document state lives in `progress_state` (`last_opened_at`,
+`remote_percent`, `pushed_percent`), merged by `recordProgressState` and pruned
+at sync for documents no longer on the device or linked. Because
+`saveSettings` flushes the entire settings table, the sync pass mutates its
+maps in memory and writes once at the end.
+
+**Old note lines.** Versions before the API accepted progress wrote a marked
+`KOReader progress: N%` line into linked books' Reader notes.
+`cleanupProgressNotes` strips them once at sync (`progress_notes_cleaned`),
+retrying while a request fails retryably, and every progress PATCH also strips
+the line if it is still there. `library/progress_note.lua` now only removes.
 
 ## Target architecture
 

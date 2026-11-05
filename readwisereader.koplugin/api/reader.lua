@@ -115,6 +115,47 @@ function Reader:updateTags(document_id, tags)
     return payload
 end
 
+-- PATCH /update/<id>/ REPLACES the document note with `notes` (an empty
+-- string clears it). Returns the text that was sent.
+function Reader:updateNotes(document_id, notes)
+    if type(document_id) ~= "string" or document_id == "" then
+        return nil, "invalid_document"
+    end
+    if type(notes) ~= "string" then
+        return nil, "invalid_notes"
+    end
+    local response, err, status = self.request("PATCH", "/update/" .. queryEscape(document_id) .. "/", {
+        notes = notes,
+    })
+    if not response then
+        return nil, err or "request_failed", status
+    end
+    return notes
+end
+
+-- PATCH /update/<id>/ with reading_progress (0-1, the LIST scale); Reader's
+-- apps then open the document there. Reader ignores it for PDFs. notes, when
+-- given, replaces the document note in the same request (used to strip the
+-- old KOReader progress line).
+function Reader:updateReadingProgress(document_id, percent, notes)
+    if type(document_id) ~= "string" or document_id == "" then
+        return nil, "invalid_document"
+    end
+    percent = tonumber(percent)
+    if not percent or percent < 0 or percent > 1 then
+        return nil, "invalid_progress"
+    end
+    local body = { reading_progress = percent }
+    if type(notes) == "string" then
+        body.notes = notes
+    end
+    local response, err, status = self.request("PATCH", "/update/" .. queryEscape(document_id) .. "/", body)
+    if not response then
+        return nil, err or "request_failed", status
+    end
+    return percent
+end
+
 local function lowerSet(tags)
     local set = {}
     for _, tag in ipairs(tags or {}) do

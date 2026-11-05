@@ -1,7 +1,10 @@
--- Reading-progress reconciliation policy.
+-- Reading-progress reconciliation policy, both directions.
 --
--- Reader exposes reading_progress (0-1) on LIST but has no documented write
--- path for a position or percentage, so progress is one-way: Reader to device.
+-- Reader exposes reading_progress (0-1) on LIST and accepts it on UPDATE, so
+-- the furthest position wins: decide() moves the device forward to Reader,
+-- decidePush() moves Reader forward to the device. Neither ever moves a side
+-- backwards, so the two cannot keep overwriting each other. Reader does not
+-- store a position for PDFs, so those stay Reader-to-device only.
 -- The mapping is approximate. Reader measures progress over its own rendering
 -- while KOReader paginates the regenerated HTML this plugin writes, so the two
 -- agree on "fraction of the document" and on nothing finer.
@@ -129,6 +132,85 @@ function Progress.decide(remote, state)
         percent = progress,
         last_opened_at = remote.last_opened_at,
     }
+end
+
+-- Decide whether Reader should be moved to the device's position.
+--
+-- local_percent: the device's percent_finished (0-1).
+-- state: { remote_percent = <0-1|nil>,  -- Reader's position, fresh when known
+--          pushed_percent = <0-1|nil>,  -- what this device last sent
+--          finished       = <bool|nil>, -- marked finished in KOReader
+--          category       = <string|nil> } -- Reader category, when known
+--
+-- A document marked finished (or at the very end) is sent as 1, so Reader
+-- shows it as read too. Archiving it stays a separate step.
+--
+-- Call it once without remote_percent to skip the network when nothing has
+-- moved since the last push, then again with Reader's fresh position.
+-- Returns the percent to send, or nil plus a reason suitable for logging.
+function Progress.decidePush(local_percent, state)
+    state = type(state) == "table" and state or {}
+    if state.category == "pdf" then
+        return nil, "Reader keeps no position for PDFs"
+    end
+
+    local percent = tonumber(local_percent)
+    if state.finished then
+        percent = 1
+    end
+    if percent == nil or percent < 0 or percent > 1 then
+        return nil, "no local progress"
+    end
+    if percent <= MIN_PROGRESS then
+        return nil, "local progress is negligible"
+    end
+
+    local pushed = tonumber(state.pushed_percent)
+    if pushed and math.abs(percent - pushed) <= DEAD_BAND then
+        return nil, "already sent"
+    end
+
+    local remote = tonumber(state.remote_percent)
+    if remote and percent <= remote + DEAD_BAND then
+        return nil, "Reader is not behind"
+    end
+
+    return percent
+end
+
+-- Decide whether a document Reader reports as finished (reading_progress 1)
+-- should be marked finished on the device, so KOReader shows it as read and
+-- the finished-articles archive action picks it up.
+--
+-- remote: { reading_progress, last_opened_at }
+-- state:  { local_finished = <bool>,        -- already finished here
+--           marked_finished = <bool>,       -- this was already done once
+--           sidecar_mtime = <epoch|nil> }   -- when the device last read
+--
+-- Done once per document, so un-finishing it on the device sticks. The device
+-- wins a tie, as in decide(): reading here after Reader's last open means the
+-- local state is the fresher one. Returns true, or false plus a reason.
+function Progress.shouldMarkFinished(remote, state)
+    if type(remote) ~= "table" then
+        return false, "no remote document"
+    end
+    state = type(state) == "table" and state or {}
+    local progress = tonumber(remote.reading_progress)
+    if progress == nil or progress < 1 then
+        return false, "not finished in Reader"
+    end
+    if state.local_finished then
+        return false, "already finished here"
+    end
+    if state.marked_finished then
+        return false, "already marked once"
+    end
+    local remote_opened = Progress.toEpoch(remote.last_opened_at)
+    local sidecar_mtime = tonumber(state.sidecar_mtime)
+    if remote_opened and sidecar_mtime and sidecar_mtime >= remote_opened then
+        return false, "device read more recently"
+    end
+    return true
 end
 
 Progress.MIN_PROGRESS = MIN_PROGRESS

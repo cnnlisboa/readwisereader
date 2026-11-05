@@ -34,6 +34,7 @@ local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local JSON = require("json")
 local LuaSettings = require("luasettings")
+local ButtonDialog = require("ui/widget/buttondialog")
 local ConfirmBox = require("ui/widget/confirmbox")
 local MultiConfirmBox = require("ui/widget/multiconfirmbox")
 local ok, ReadCollection = pcall(require, "readcollection")
@@ -63,6 +64,8 @@ local LocalLinks = require("library/local_links")
 local Paths = require("library/paths")
 local Progress = require("library/progress")
 local ProgressNote = require("library/progress_note")
+local ReaderNote = require("library/reader_note")
+local TagFilter = require("library/tag_filter")
 local ReaderAPI = require("api/reader")
 local HighlightsAPI = require("api/highlights")
 local ReaderHighlightsAPI = require("api/reader_highlights")
@@ -168,11 +171,15 @@ function ReadwiseReader:init()
     self.download_covers = settings.download_covers == nil and true or settings.download_covers
     self.document_cover_urls = settings.document_cover_urls or {}
 
-    -- Reading position travels one way only. Reader's LIST exposes
-    -- reading_progress but UPDATE documents no percentage or position field, so
-    -- nothing is ever pushed back; the completion-to-archive path stays the only
-    -- device-to-Reader signal. Off by default because the mapping is approximate.
+    -- Reading position travels both ways and the furthest position wins (see
+    -- library/progress.lua): opening a document pulls Reader's position,
+    -- closing it or putting the device to sleep pushes this device's, and sync
+    -- does both for downloaded articles. Off by default because the mapping
+    -- is approximate.
     self.sync_reading_progress = settings.sync_reading_progress or false
+    -- Older versions wrote a "KOReader progress: N%" line into linked books'
+    -- Reader notes. Set once every such line has been stripped.
+    self.progress_notes_cleaned = settings.progress_notes_cleaned or false
     -- Library browsing only; podcasts and audiobooks are always hidden there.
     self.show_videos = settings.show_videos ~= false
     -- What Reader reported the last time each document was examined, so an
@@ -188,6 +195,12 @@ function ReadwiseReader:init()
     -- Tag edits made while offline: { id, add = {...}, remove = {...} } per
     -- document, re-applied on top of Reader's current tags at the next sync.
     self.pending_tag_updates = settings.pending_tag_updates or {}
+    -- Reader document notes, edited from KOReader. The note each local
+    -- article or linked book had at the last sync is kept so it can be edited
+    -- offline; edits made offline wait in pending_note_updates as
+    -- { id, title, base, text }, base being the note the edit started from.
+    self.document_notes = settings.document_notes or {}
+    self.pending_note_updates = settings.pending_note_updates or {}
 
     -- Highlights in Reader documents are placed in Reader itself (see
     -- api/reader_highlights.lua). Only those made from the first launch of this
@@ -283,10 +296,54 @@ function ReadwiseReader:init()
         archive_document = function(document)
             return self:archiveFromBrowser(document)
         end,
+        edit_note = function(document)
+            self:editReaderNote({ id = document.id, title = document.title })
+        end,
     }
     
     self.ui.menu:registerToMainMenu(self)
     self:registerExternalLinkAction()
+    self:registerFileDialogButtons()
+end
+
+-- Holding a file in KOReader's library offers Reader tags and note for a
+-- downloaded article or a linked book. addFileDialogButtons exists only on
+-- the File Manager (and only in KOReader versions that have it).
+function ReadwiseReader:registerFileDialogButtons()
+    if type(self.ui.addFileDialogButtons) ~= "function" then
+        return
+    end
+    self.ui:addFileDialogButtons("readwisereader", function(file, is_file)
+        if not is_file then
+            return nil
+        end
+        local target = self:getReaderTarget(file)
+        if not target then
+            return nil
+        end
+        local function closeDialog()
+            local chooser = self.ui.file_chooser
+            if chooser and chooser.file_dialog then
+                UIManager:close(chooser.file_dialog)
+            end
+        end
+        return {
+            {
+                text = _("Reader tags"),
+                callback = function()
+                    closeDialog()
+                    self:editReaderTags(target)
+                end,
+            },
+            {
+                text = _("Reader note"),
+                callback = function()
+                    closeDialog()
+                    self:editReaderNote(target)
+                end,
+            },
+        }
+    end)
 end
 
 -- Adds "Save to Readwise Later" to KOReader's own external-link dialog
@@ -312,6 +369,18 @@ end
 -- ===============================================================================
 -- SIMPLE ADAPTIVE RATE LIMITING
 -- ===============================================================================
+
+-- Runs fn with fast requests (see callAPI) and returns its first result.
+function ReadwiseReader:withFastRequests(fn)
+    local previous = self.fast_requests
+    self.fast_requests = true
+    local ok, result = pcall(fn)
+    self.fast_requests = previous
+    if not ok then
+        error(result, 0)
+    end
+    return result
+end
 
 function ReadwiseReader:checkRateLimit()
     -- Only start counting after we make some API calls
@@ -763,11 +832,15 @@ function ReadwiseReader:getCurrentLocalProgress(filepath)
     if self.ui and self.ui.saveSettings then
         pcall(function() self.ui:saveSettings() end)
     end
-    local percent = self:readLocalProgressState(filepath)
+    local percent, _, finished = self:readLocalProgressState(filepath)
     if type(percent) ~= "number" or percent < 0 or percent > 1 then
-        return nil
+        percent = nil
     end
-    return percent
+    -- Marked finished in KOReader counts as 100%, wherever the page is.
+    if finished then
+        percent = 1
+    end
+    return percent, finished
 end
 
 function ReadwiseReader:getLinkedReaderDocument(link)
@@ -798,7 +871,10 @@ function ReadwiseReader:showLinkedReaderDocumentError(err, status)
     UIManager:show(InfoMessage:new{ text = message, timeout = 4 })
 end
 
-function ReadwiseReader:sendCurrentProgressToReaderNote()
+-- Manual send for a linked book: sets Reader to this device's position even
+-- when Reader is further ahead (the user asked for it), and strips the old
+-- KOReader progress note line in the same request.
+function ReadwiseReader:sendCurrentProgressToReader()
     self:runSyncAction(function()
         local local_book, link = self:getLinkedCurrentLocalBook()
         if not local_book or not link then
@@ -818,21 +894,24 @@ function ReadwiseReader:sendCurrentProgressToReaderNote()
             self:showLinkedReaderDocumentError(err, status)
             return
         end
-        local notes, changed = ProgressNote.upsert(document.notes, percent)
-        if not changed then
+        if document.category == "pdf" then
             UIManager:show(InfoMessage:new{
-                text = string.format("Reader note already shows KOReader progress: %d%%.", roundedPercent(percent)),
-                timeout = 3,
+                text = "Readwise Reader can't store a reading position for PDFs yet.",
+                timeout = 4,
             })
             return
         end
-        local result, update_err, update_status = self:updateReaderDocumentNotes(document.id, notes)
-        if not result then
+        local notes, had_note_line = ProgressNote.remove(document.notes)
+        local sent, update_err, update_status = self.reader_api:updateReadingProgress(document.id, percent,
+            had_note_line and notes or nil)
+        if not sent then
             self:showLinkedReaderDocumentError(update_err, update_status)
             return
         end
+        self:recordProgressState(document.id, { pushed_percent = percent, remote_percent = percent })
+        self:saveSettings()
         UIManager:show(InfoMessage:new{
-            text = string.format("Added KOReader progress (%d%%) to the Reader note.", roundedPercent(percent)),
+            text = string.format("Readwise Reader now opens this book at about %d%%.", roundedPercent(percent)),
             timeout = 3,
         })
     end)
@@ -881,60 +960,6 @@ function ReadwiseReader:applyReaderProgressToCurrentBook()
                         timeout = 3,
                     })
                 end)
-            end,
-        })
-    end)
-end
-
-function ReadwiseReader:removeCurrentProgressFromReaderNote()
-    self:runSyncAction(function()
-        local local_book, link = self:getLinkedCurrentLocalBook()
-        if not local_book or not link then
-            UIManager:show(InfoMessage:new{ text = "Link the current local book to Reader first.", timeout = 3 })
-            return
-        end
-        local document, err, status = self:getLinkedReaderDocument(link)
-        if not document then
-            self:showLinkedReaderDocumentError(err, status)
-            return
-        end
-        local _, removed = ProgressNote.remove(document.notes)
-        if not removed then
-            UIManager:show(InfoMessage:new{
-                text = "The linked Reader note has no KOReader progress line to remove.",
-                timeout = 3,
-            })
-            return
-        end
-        UIManager:show(ConfirmBox:new{
-            text = "Remove only the KOReader progress line from this Reader note?\n\n"
-                .. "All of your other Reader note text will remain unchanged.",
-            ok_text = "Remove progress",
-            ok_callback = function()
-                -- Re-read after confirmation so a note edited in Reader while
-                -- the confirmation was open is preserved too.
-                local latest, latest_err, latest_status = self:getLinkedReaderDocument(link)
-                if not latest then
-                    self:showLinkedReaderDocumentError(latest_err, latest_status)
-                    return
-                end
-                local latest_notes, latest_removed = ProgressNote.remove(latest.notes)
-                if not latest_removed then
-                    UIManager:show(InfoMessage:new{
-                        text = "The KOReader progress line was already removed from the Reader note.",
-                        timeout = 3,
-                    })
-                    return
-                end
-                local result, update_err, update_status = self:updateReaderDocumentNotes(latest.id, latest_notes)
-                if not result then
-                    self:showLinkedReaderDocumentError(update_err, update_status)
-                    return
-                end
-                UIManager:show(InfoMessage:new{
-                    text = "Removed the KOReader progress line from the Reader note.",
-                    timeout = 3,
-                })
             end,
         })
     end)
@@ -1260,17 +1285,40 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = "Reader tags for this document",
+                help_text = "Edit the Readwise Reader tags of the open article or linked book. You can also hold a file in the library and choose Reader tags.",
+                enabled_func = function()
+                    return self:readerNoteTarget() ~= nil
+                end,
+                callback = function(touchmenu_instance)
+                    if touchmenu_instance then touchmenu_instance:closeMenu() end
+                    self:editReaderTags(self:readerNoteTarget())
+                end,
+            },
+            {
+                text = "Reader note for this document",
+                help_text = "Edit the Readwise Reader note of the open article or linked book, in Writer Deck when it is installed. Offline edits are sent at the next sync.",
+                enabled_func = function()
+                    return self:readerNoteTarget() ~= nil
+                end,
+                callback = function(touchmenu_instance)
+                    if touchmenu_instance then touchmenu_instance:closeMenu() end
+                    self:editReaderNote(self:readerNoteTarget())
+                end,
+            },
+            {
                 text = "Linked book progress",
-                help_text = "Manual actions for the current linked local book. Sending writes only a marked KOReader percentage line in the Reader document note.",
+                help_text = "Manual actions for the current linked local book. To do this automatically, turn on Settings → Sync reading position with Readwise Reader.",
                 enabled_func = function()
                     local _, link = self:getLinkedCurrentLocalBook()
                     return link ~= nil
                 end,
                 sub_item_table = {
                     {
-                        text = "Send KOReader progress to Reader note",
+                        text = "Send KOReader progress to Reader",
+                        help_text = "Sets the Readwise Reader position to this book's KOReader position, even if Reader is further ahead. Not available for PDFs.",
                         callback = function()
-                            self:sendCurrentProgressToReaderNote()
+                            self:sendCurrentProgressToReader()
                         end,
                     },
                     {
@@ -1278,13 +1326,6 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         help_text = "Moves the open book to Reader's percentage after confirmation. The position is approximate.",
                         callback = function()
                             self:applyReaderProgressToCurrentBook()
-                        end,
-                    },
-                    {
-                        text = "Remove KOReader progress from Reader note",
-                        help_text = "Removes only the marked KOReader progress line after confirmation.",
-                        callback = function()
-                            self:removeCurrentProgressFromReaderNote()
                         end,
                     },
                 },
@@ -1374,6 +1415,23 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         callback = function()
                             self:runSyncAction(function()
                                 self:flushPendingTagUpdates(true)
+                            end)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            local count = #self.pending_note_updates
+                            return count > 0
+                                and string.format("Send queued note changes (%d)", count)
+                                or "Send queued note changes"
+                        end,
+                        help_text = "Reader note edits made while offline wait here until sent. They also send automatically at the next sync or when the network returns.",
+                        enabled_func = function()
+                            return #self.pending_note_updates > 0
+                        end,
+                        callback = function()
+                            self:runSyncAction(function()
+                                self:flushPendingNoteUpdates(true)
                             end)
                         end,
                     },
@@ -1508,11 +1566,14 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                     },
                     {
-                        text = "Start at Readwise Reader position",
-                        help_text = "When an article was read further in Readwise Reader on "
-                            .. "another device, jump to roughly that place on opening it here. "
-                            .. "The position is approximate, and it is never sent back: "
-                            .. "Readwise Reader's API has no way to store a position from KOReader.",
+                        text = "Sync reading position with Readwise Reader",
+                        help_text = "For downloaded articles and linked books. Opening one jumps to "
+                            .. "your Readwise Reader position if you read further there. Closing it, "
+                            .. "or putting the device to sleep, sends your KOReader position to Reader "
+                            .. "if you read further here. Sync does both for downloaded articles. "
+                            .. "The furthest position always wins and nothing is moved backwards. "
+                            .. "Only works while Wi-Fi is on; the next sync catches up otherwise. "
+                            .. "Positions are approximate. PDFs only receive Reader's position.",
                         checked_func = function()
                             return self.sync_reading_progress
                         end,
@@ -1869,7 +1930,7 @@ end
 function ReadwiseReader:documentHasTag(doc_id, tag)
     if self.document_tags and self.document_tags[doc_id] then
         for _, doc_tag in ipairs(self.document_tags[doc_id]) do
-            if doc_tag == tag then
+            if doc_tag:lower() == tag:lower() then
                 return true
             end
         end
@@ -2001,30 +2062,28 @@ function ReadwiseReader:updateAvailableTags(documents)
     end
 end
 
+-- Excluded types and tags are matched against the document's own tags, as
+-- the current sync received them, ignoring case (library/tag_filter.lua).
+-- They used to be matched against the tags saved at the previous sync, so a
+-- new article with an excluded tag was downloaded once and removed a sync
+-- later.
 function ReadwiseReader:shouldSkipDocument(document)
-    if self.document_locations and self.document_locations[document.id] then
-        local doc_location = self.document_locations[document.id]
+    local location = document.location or (self.document_locations and self.document_locations[document.id])
+    if location then
         for _, excluded_location in ipairs(self.excluded_locations) do
-            if doc_location == excluded_location then
+            if location == excluded_location then
                 logger.dbg("ReadwiseReader:shouldSkipDocument: skipping document", document.id, "due to excluded location:", excluded_location)
                 return true
             end
         end
     end
-    
-    if not self.document_tags or not self.document_tags[document.id] then
-        return false
+
+    local match = TagFilter.excludedBy(document, self.excluded_tags,
+        self.document_tags and self.document_tags[document.id])
+    if match then
+        logger.dbg("ReadwiseReader:shouldSkipDocument: skipping document", document.id, "due to excluded tag:", match)
+        return true
     end
-    
-    for _, doc_tag in ipairs(self.document_tags[document.id]) do
-        for _, excluded_tag in ipairs(self.excluded_tags) do
-            if doc_tag == excluded_tag then
-                logger.dbg("ReadwiseReader:shouldSkipDocument: skipping document", document.id, "due to excluded tag:", excluded_tag)
-                return true
-            end
-        end
-    end
-    
     return false
 end
 
@@ -2205,7 +2264,11 @@ function ReadwiseReader:callAPI(method, endpoint, body, quiet, base_url)
 
     logger.dbg("ReadwiseReader:callAPI:", method, endpoint)
 
-    local max_attempts = 3
+    -- Fast requests run while a book is open (open, close, sleep): one try,
+    -- short timeouts and no rate-limit waits, so a bad connection costs the
+    -- reader a few seconds at most. Sync and menu actions keep the patient path.
+    local fast = self.fast_requests
+    local max_attempts = fast and 1 or 3
     local code, resp_headers, status
 
     for attempt = 1, max_attempts do
@@ -2215,8 +2278,12 @@ function ReadwiseReader:callAPI(method, endpoint, body, quiet, base_url)
             request.source = ltn12.source.string(json_body)
         end
 
-        self:checkRateLimit()
-        socketutil:set_timeout(10, 60)
+        if fast then
+            socketutil:set_timeout(3, 6)
+        else
+            self:checkRateLimit()
+            socketutil:set_timeout(10, 60)
+        end
         code, resp_headers, status = socket.skip(1, http.request(request))
         socketutil:reset_timeout()
 
@@ -2388,11 +2455,362 @@ function ReadwiseReader:onNetworkConnected()
     if self.pending_tag_updates and #self.pending_tag_updates > 0 then
         self:flushPendingTagUpdates(false)
     end
+    if self.pending_note_updates and #self.pending_note_updates > 0 then
+        self:flushPendingNoteUpdates(false)
+    end
 end
 
 -- ===============================================================================
 -- TAG EDITS
 -- ===============================================================================
+
+-- The Reader document behind a local file, for tag and note actions: a
+-- downloaded article (Reader id in the filename) or a linked local book.
+-- Cheap (filename and link lookup only), because it runs every time a file is
+-- held in the library and every time Writer Deck builds its menu.
+function ReadwiseReader:getReaderTarget(filepath)
+    if type(filepath) ~= "string" or filepath == "" then
+        return nil
+    end
+    local doc_id = self:getDocumentIdFromPath(filepath)
+    if doc_id then
+        local _dir, filename = util.splitFilePathName(filepath)
+        local title = filename:match("%] (.*)%.[^%.]+$") or filename
+        return { id = doc_id, title = title, filepath = filepath }
+    end
+    local link = self:getLocalBookLink(filepath)
+    if link then
+        return { id = link.id, title = link.title, filepath = filepath }
+    end
+    return nil
+end
+
+-- For Writer Deck and the menu: the open document's Reader target, or nil.
+function ReadwiseReader:readerNoteTarget()
+    local document = self.ui and self.ui.document
+    return document and self:getReaderTarget(document.file) or nil
+end
+
+-- Tag picker for any Reader target. The browser's flow fetches the current
+-- tags first and falls back to the ones saved at the last sync when offline.
+function ReadwiseReader:editReaderTags(target)
+    if not target then
+        return
+    end
+    local tags = {}
+    for _, tag in ipairs(self.document_tags[target.id] or {}) do
+        if not self:isDocumentCategory(tag) then
+            table.insert(tags, tag)
+        end
+    end
+    self.browser:editTags({ id = target.id, title = target.title, tags = tags }, nil)
+end
+
+-- READER NOTE ------------------------------------------------------------------
+
+function ReadwiseReader:findQueuedNote(doc_id)
+    for index, item in ipairs(self.pending_note_updates) do
+        if item.id == doc_id then
+            return item, index
+        end
+    end
+    return nil
+end
+
+function ReadwiseReader:dropQueuedNote(doc_id)
+    local _, index = self:findQueuedNote(doc_id)
+    if index then
+        table.remove(self.pending_note_updates, index)
+    end
+end
+
+-- A later edit replaces a queued one but keeps the note it started from, so
+-- the eventual send still knows what Reader had then.
+function ReadwiseReader:queueNoteUpdate(target, base, text)
+    local item = self:findQueuedNote(target.id)
+    if item then
+        item.text = text
+    else
+        table.insert(self.pending_note_updates, {
+            id = target.id, title = target.title, base = base, text = text, queued_at = os.time(),
+        })
+    end
+    self:saveSettings()
+end
+
+-- Opens text in Writer Deck's editor when that plugin offers one, otherwise
+-- in KOReader's full-screen text box. on_save(text) runs once, on save.
+function ReadwiseReader:openNoteEditor(title, text, on_save)
+    local writer_deck = self.ui and self.ui.writer_deck
+    if writer_deck and type(writer_deck.openExternal) == "function" then
+        local ok, err = pcall(writer_deck.openExternal, writer_deck, {
+            title = title,
+            text = text,
+            on_save = on_save,
+        })
+        if ok then
+            return
+        end
+        logger.warn("ReadwiseReader:openNoteEditor: Writer Deck failed, using the built-in editor", err)
+    end
+    local dialog
+    dialog = InputDialog:new{
+        title = title,
+        input = text,
+        fullscreen = true,
+        condensed = true,
+        allow_newline = true,
+        cursor_at_end = true,
+        add_nav_bar = true,
+        buttons = {{
+            {
+                text = _("Cancel"),
+                id = "close",
+                callback = function() UIManager:close(dialog) end,
+            },
+            {
+                text = _("Save"),
+                callback = function()
+                    local edited = dialog:getInputText()
+                    UIManager:close(dialog)
+                    on_save(edited)
+                end,
+            },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+-- Edit the Reader note of a target. Online, the note is read fresh; offline,
+-- the copy from the last sync is used, or, with none, the edit starts empty
+-- and is added to the end of the note. A queued offline edit is picked up
+-- where it was left. extra (a quote from Writer Deck) is added to the end.
+function ReadwiseReader:editReaderNote(target, extra)
+    if not target then
+        return
+    end
+    if not self:hasAccessToken() then
+        UIManager:show(InfoMessage:new{ text = _("Configure your Readwise access token first."), timeout = 3 })
+        return
+    end
+
+    local base, text
+    local queued = self:findQueuedNote(target.id)
+    if queued then
+        base, text = queued.base, queued.text
+    else
+        local document
+        if NetworkMgr:isOnline() then
+            self:showProgress(_("Loading Reader note…"))
+            local ok, result = pcall(function()
+                return self:withFastRequests(function()
+                    return self.reader_api:getDocument(target.id, false)
+                end)
+            end)
+            self:hideProgress()
+            document = ok and result or nil
+        end
+        if document then
+            base = document.notes or ""
+            self.document_notes[target.id] = base
+            self:saveSettings()
+        elseif self.document_notes[target.id] ~= nil then
+            base = self.document_notes[target.id]
+            UIManager:show(InfoMessage:new{
+                text = _("Offline: editing the note saved at the last sync. Your changes will be sent later."),
+                timeout = 3,
+            })
+        else
+            UIManager:show(InfoMessage:new{
+                text = _("Offline: what you write will be added to the end of the Reader note when it is sent."),
+                timeout = 4,
+            })
+        end
+        text = base or ""
+    end
+    if type(extra) == "string" and extra ~= "" then
+        text = ReaderNote.append(text, extra)
+    end
+
+    self:openNoteEditor(_("Reader note · ") .. (target.title or ""), text, function(edited)
+        UIManager:nextTick(function()
+            self:saveReaderNote(target, base, edited)
+        end)
+    end)
+end
+
+function ReadwiseReader:sendReaderNote(target, text)
+    self:showProgress(_("Saving Reader note…"))
+    local sent, err, status = self.reader_api:updateNotes(target.id, text)
+    self:hideProgress()
+    if sent then
+        self:dropQueuedNote(target.id)
+        self.document_notes[target.id] = text
+        self:saveSettings()
+        UIManager:show(InfoMessage:new{ text = _("Reader note saved."), timeout = 2 })
+        return true
+    end
+    if ReaderAPI.isRetryable(err, status) then
+        return false, "retry"
+    end
+    UIManager:show(InfoMessage:new{
+        text = (status == 401 or status == 403) and _("Reader authentication failed. Check your Readwise access token.")
+            or _("Could not save the Reader note."),
+        timeout = 4,
+    })
+    return false, "failed"
+end
+
+-- Save an edit. Reader is read first: unchanged since the edit began, the
+-- edit replaces the note; changed meanwhile, the user chooses. Offline (or
+-- on a retryable failure) the edit is queued.
+function ReadwiseReader:saveReaderNote(target, base, edited)
+    local function queue()
+        self:queueNoteUpdate(target, base, edited)
+        UIManager:show(InfoMessage:new{
+            text = _("Couldn't reach Readwise. The note is saved here and will be sent at the next sync."),
+            timeout = 4,
+        })
+    end
+    if base ~= nil and edited == base and not self:findQueuedNote(target.id) then
+        return
+    end
+    if not NetworkMgr:isOnline() then
+        queue()
+        return
+    end
+
+    self:showProgress(_("Saving Reader note…"))
+    local remote, err, status = self.reader_api:getDocument(target.id, false)
+    self:hideProgress()
+    if not remote then
+        if ReaderAPI.isRetryable(err, status) then
+            queue()
+        else
+            UIManager:show(InfoMessage:new{ text = _("Could not load the Reader document to save its note."), timeout = 4 })
+        end
+        return
+    end
+
+    local function send(text)
+        local _sent, why = self:sendReaderNote(target, text)
+        if why == "retry" then
+            queue()
+        end
+    end
+
+    local result = ReaderNote.resolve(base, remote.notes, edited)
+    if result.action == "none" then
+        self:dropQueuedNote(target.id)
+        self.document_notes[target.id] = remote.notes or ""
+        self:saveSettings()
+        return
+    end
+    if result.action == "send" then
+        send(result.text)
+        return
+    end
+
+    local dialog
+    dialog = ButtonDialog:new{
+        title = _("The Reader note changed while you were editing it."),
+        title_align = "center",
+        buttons = {
+            {{ text = _("Add mine to the end"), callback = function()
+                UIManager:close(dialog)
+                send(result.merged)
+            end }},
+            {{ text = _("Replace with mine"), callback = function()
+                UIManager:close(dialog)
+                send(edited)
+            end }},
+            {{ text = _("Keep Reader's"), callback = function()
+                UIManager:close(dialog)
+                self:dropQueuedNote(target.id)
+                self.document_notes[target.id] = remote.notes or ""
+                self:saveSettings()
+            end }},
+        },
+    }
+    UIManager:show(dialog)
+end
+
+-- Sends queued offline note edits. Nobody is asked here: if Reader changed
+-- meanwhile, both versions are kept (ReaderNote.merge).
+function ReadwiseReader:flushPendingNoteUpdates(announce)
+    if #self.pending_note_updates == 0 then
+        if announce then
+            UIManager:show(InfoMessage:new{ text = _("No queued note changes to send."), timeout = 3 })
+        end
+        return
+    end
+    if not self:hasAccessToken() or not NetworkMgr:isOnline() then
+        if announce then
+            UIManager:show(InfoMessage:new{ text = _("Still offline - queued note changes will send later."), timeout = 3 })
+        end
+        return
+    end
+    local remaining, sent = {}, 0
+    for _, item in ipairs(self.pending_note_updates) do
+        local remote, err, status = self.reader_api:getDocument(item.id, false)
+        local keep = false
+        if remote then
+            local result = ReaderNote.resolve(item.base, remote.notes, item.text)
+            local text = result.action == "send" and result.text or result.merged
+            if text then
+                local ok, update_err, update_status = self.reader_api:updateNotes(item.id, text)
+                if ok then
+                    sent = sent + 1
+                    self.document_notes[item.id] = text
+                else
+                    keep = ReaderAPI.isRetryable(update_err, update_status)
+                end
+            else
+                self.document_notes[item.id] = remote.notes or ""
+            end
+        else
+            keep = ReaderAPI.isRetryable(err, status)
+        end
+        if keep then
+            table.insert(remaining, item)
+        elseif not remote then
+            logger.warn("ReadwiseReader:flushPendingNoteUpdates: dropping note for", item.id, err, status)
+        end
+    end
+    self.pending_note_updates = remaining
+    self:saveSettings()
+    if announce then
+        UIManager:show(InfoMessage:new{
+            text = #remaining == 0 and string.format(_("Sent %d queued note change(s)."), sent)
+                or string.format(_("Sent %d queued note change(s); %d still queued."), sent, #remaining),
+            timeout = 3,
+        })
+    end
+end
+
+-- Keeps the note of every downloaded article and linked book from the sync
+-- list, so it can be edited offline. Linked books are usually not in the
+-- list, so their last known note is kept.
+function ReadwiseReader:cacheDocumentNotes(documents)
+    local local_ids = {}
+    self:forEachLocalDocument(function(doc_id)
+        local_ids[doc_id] = true
+    end)
+    local cache = {}
+    for filepath in pairs(self.local_book_links or {}) do
+        local link = self:getLocalBookLink(filepath)
+        if link and self.document_notes[link.id] ~= nil then
+            cache[link.id] = self.document_notes[link.id]
+        end
+    end
+    for _, doc in ipairs(documents) do
+        if doc.id and local_ids[doc.id] then
+            cache[doc.id] = type(doc.notes) == "string" and doc.notes or ""
+        end
+    end
+    self.document_notes = cache
+end
 
 -- Tag names for the picker when Reader's tag list can't be fetched: the tags
 -- seen on documents during sync, minus the category pseudo-tags.
@@ -2495,8 +2913,13 @@ function ReadwiseReader:flushPendingTagUpdates(announce)
     end
 end
 
+-- Returns the documents to sync and, separately, the ones Reader reports as
+-- finished (reading_progress 1). Finished ones are never downloaded and don't
+-- count toward the per-sync limit, but a copy already on the device is kept:
+-- finishing an article is not the same as archiving it.
 function ReadwiseReader:getDocumentList()
     local documents = {}
+    local finished_documents = {}
     local next_cursor = nil
     -- Shared across locations: once the cap is hit, later locations must not
     -- add another article each before noticing.
@@ -2551,7 +2974,11 @@ function ReadwiseReader:getDocumentList()
                         -- Treat a missing value as unread rather than dropping the
                         -- document.
                         local progress = tonumber(doc.reading_progress)
-                        if progress == nil or progress < 1 then
+                        if progress and progress >= 1 then
+                            if not self:shouldSkipDocument(doc) then
+                                table.insert(finished_documents, doc)
+                            end
+                        else
                             -- Apply tag/location filtering during collection
                             if not self:shouldSkipDocument(doc) then
                                 table.insert(documents, doc)
@@ -2581,8 +3008,9 @@ function ReadwiseReader:getDocumentList()
         end
     end
 
-    logger.dbg("ReadwiseReader:getDocumentList: total documents retrieved:", #documents)
-    return documents
+    logger.dbg("ReadwiseReader:getDocumentList: total documents retrieved:", #documents,
+        "finished:", #finished_documents)
+    return documents, finished_documents
 end
 
 function ReadwiseReader:getArchivedDocuments(since_date)
@@ -3627,11 +4055,15 @@ end
 
 function ReadwiseReader:readLocalProgressState(filepath)
     if not DocSettings:hasSidecarFile(filepath) then
-        return nil, nil
+        return nil, nil, false
     end
 
+    local finished = false
     local ok_read, percent = pcall(function()
-        return DocSettings:open(filepath):readSetting("percent_finished")
+        local doc_settings = DocSettings:open(filepath)
+        local summary = doc_settings:readSetting("summary")
+        finished = type(summary) == "table" and summary.status == "complete"
+        return doc_settings:readSetting("percent_finished")
     end)
 
     -- The sidecar's mtime is when the device last recorded a position, which is
@@ -3644,7 +4076,7 @@ function ReadwiseReader:readLocalProgressState(filepath)
         mtime = lfs.attributes(sidecar, "modification")
     end
 
-    return ok_read and tonumber(percent) or nil, mtime
+    return ok_read and tonumber(percent) or nil, mtime, finished
 end
 
 -- Write percent_finished so the File Manager shows Reader's figure before the
@@ -3661,6 +4093,49 @@ function ReadwiseReader:writeSidecarPercent(filepath, percent)
     return ok_write
 end
 
+-- Merges what is known about one document's position on both sides into
+-- progress_state: last_opened_at (Reader activity already acted on),
+-- remote_percent (Reader's latest position) and pushed_percent (what this
+-- device last sent). Fields not given are kept.
+function ReadwiseReader:recordProgressState(doc_id, fields)
+    local state = self.progress_state[doc_id] or {}
+    for key, value in pairs(fields) do
+        state[key] = value
+    end
+    self.progress_state[doc_id] = state
+end
+
+-- Finished in Reader: mark the local copy finished too, once, so KOReader
+-- shows it as read and "Archive finished articles" can pick it up. Never
+-- touches the open document's sidecar, which belongs to ReaderUI.
+function ReadwiseReader:markFinishedFromReader(document, filepath, local_finished, sidecar_mtime)
+    local state = self.progress_state[document.id] or {}
+    local yes, reason = Progress.shouldMarkFinished(document, {
+        local_finished = local_finished,
+        marked_finished = state.marked_finished,
+        sidecar_mtime = sidecar_mtime,
+    })
+    if not yes then
+        logger.dbg("ReadwiseReader:markFinishedFromReader:", document.id, "not marked -", reason)
+        return false
+    end
+    if self:isDocumentOpen(filepath) then
+        return false
+    end
+    local ok = pcall(function()
+        local doc_settings = DocSettings:open(filepath)
+        local summary = doc_settings:readSetting("summary") or {}
+        summary.status = "complete"
+        doc_settings:saveSetting("summary", summary)
+        doc_settings:saveSetting("percent_finished", 1)
+        doc_settings:flush()
+    end)
+    if ok then
+        self:recordProgressState(document.id, { marked_finished = true, pushed_percent = 1, remote_percent = 1 })
+    end
+    return ok
+end
+
 -- Records a seed for later application; never jumps directly, because the
 -- document is usually not open when sync runs.
 function ReadwiseReader:seedReadingProgress(document, filepath)
@@ -3668,7 +4143,7 @@ function ReadwiseReader:seedReadingProgress(document, filepath)
         return false
     end
 
-    local local_percent, sidecar_mtime = self:readLocalProgressState(filepath)
+    local local_percent, sidecar_mtime, local_finished = self:readLocalProgressState(filepath)
     local seed, reason = Progress.decide(document, {
         seen_last_opened_at = (self.progress_state[document.id] or {}).last_opened_at,
         local_percent = local_percent,
@@ -3677,26 +4152,34 @@ function ReadwiseReader:seedReadingProgress(document, filepath)
 
     if not seed then
         logger.dbg("ReadwiseReader:seedReadingProgress:", document.id, "not seeded -", reason)
+        if reason == "remote document is finished" then
+            self:markFinishedFromReader(document, filepath, local_finished, sidecar_mtime)
+        end
         -- Still record what Reader reported, so the next sync compares against
         -- this observation rather than re-evaluating the same activity.
-        if document.last_opened_at then
-            self.progress_state[document.id] = { last_opened_at = document.last_opened_at }
-        end
+        self:recordProgressState(document.id, {
+            last_opened_at = document.last_opened_at,
+            remote_percent = tonumber(document.reading_progress),
+        })
         return false
     end
 
     self:writeSidecarPercent(filepath, seed.percent)
     self.pending_progress_seeds[document.id] = seed.percent
-    self.progress_state[document.id] = { last_opened_at = seed.last_opened_at }
+    self:recordProgressState(document.id, {
+        last_opened_at = seed.last_opened_at,
+        remote_percent = seed.percent,
+    })
     logger.dbg("ReadwiseReader:seedReadingProgress: seeded", document.id, "at", seed.percent)
     return true
 end
 
--- Sync-time pass over documents already on the device: the case where an
--- article was read further in Reader elsewhere since the last sync.
+-- Sync-time pass over documents already on the device: an article read
+-- further in Reader elsewhere since the last sync is seeded here, and one read
+-- further on this device (including offline) is pushed. Returns seeded, pushed.
 function ReadwiseReader:reconcileReadingProgress(documents)
     if not self.sync_reading_progress or type(documents) ~= "table" then
-        return 0
+        return 0, 0
     end
 
     -- One directory scan for the whole pass, matching the browser's approach.
@@ -3705,30 +4188,54 @@ function ReadwiseReader:reconcileReadingProgress(documents)
         local_paths[doc_id] = filepath
     end)
 
-    local seeded = 0
+    -- Each article goes one way at most per sync: forward to Reader's
+    -- position if Reader is ahead, otherwise Reader forward to this device's.
+    -- The list already carries Reader's fresh position, so no extra reads.
+    local seeded, pushed = 0, 0
     for _, document in ipairs(documents) do
         local filepath = document.id and local_paths[document.id]
         if filepath then
             local ok_seed, result = pcall(function()
-                return self:seedReadingProgress(document, filepath)
+                if self:seedReadingProgress(document, filepath) then
+                    return "seeded"
+                end
+                local local_percent, _, finished = self:readLocalProgressState(filepath)
+                if self:pushReadingProgress(document.id, local_percent, document, nil, finished) then
+                    return "pushed"
+                end
             end)
             if not ok_seed then
                 logger.warn("ReadwiseReader:reconcileReadingProgress: failed for", document.id, result)
-            elseif result then
+            elseif result == "seeded" then
                 seeded = seeded + 1
+            elseif result == "pushed" then
+                pushed = pushed + 1
             end
+        end
+    end
+    pushed = pushed + self:pushLinkedBooksProgress()
+
+    -- Linked books keep their state under their Reader id, not a local file.
+    local keep = {}
+    for doc_id in pairs(local_paths) do
+        keep[doc_id] = true
+    end
+    for filepath in pairs(self.local_book_links or {}) do
+        local link = self:getLocalBookLink(filepath)
+        if link then
+            keep[link.id] = true
         end
     end
 
     -- Articles are deleted locally once archived, so drop the bookkeeping for
     -- anything no longer on the device rather than growing these maps forever.
     for doc_id in pairs(self.pending_progress_seeds) do
-        if not local_paths[doc_id] then
+        if not keep[doc_id] then
             self.pending_progress_seeds[doc_id] = nil
         end
     end
     for doc_id in pairs(self.progress_state) do
-        if not local_paths[doc_id] then
+        if not keep[doc_id] then
             self.progress_state[doc_id] = nil
         end
     end
@@ -3737,14 +4244,223 @@ function ReadwiseReader:reconcileReadingProgress(documents)
     -- memory across the entire pass and written exactly once here.
     self:saveSettings()
 
-    logger.dbg("ReadwiseReader:reconcileReadingProgress: seeded", seeded, "document(s)")
-    return seeded
+    logger.dbg("ReadwiseReader:reconcileReadingProgress: seeded", seeded, "pushed", pushed)
+    return seeded, pushed
 end
 
--- Apply a pending seed when the document is opened. GotoPercent is used rather
--- than the sidecar's last_percent because readerrolling honours last_percent
--- only when last_xpointer is absent, and that branch is marked deprecated
--- upstream; a re-seeded document usually has a local xpointer already.
+-- The Reader document behind a local file: a downloaded article (id in the
+-- filename) or a sideloaded book explicitly linked to Reader. The category is
+-- known up front only for links; it decides whether a push is possible.
+function ReadwiseReader:getReaderIdentity(filepath)
+    if type(filepath) ~= "string" or filepath == "" then
+        return nil
+    end
+    local doc_id = self:getDocumentIdFromPath(filepath)
+    if doc_id then
+        return doc_id, nil
+    end
+    local link = self:getLocalBookLink(filepath)
+    if link then
+        return link.id, link.category
+    end
+    return nil
+end
+
+function ReadwiseReader:hasAccessToken()
+    return type(self.access_token) == "string" and self.access_token ~= ""
+end
+
+local function jumpToPercent(ui, percent, context)
+    UIManager:nextTick(function()
+        local ok_jump, err = pcall(function()
+            ui:handleEvent(Event:new("GotoPercent", percent * 100))
+        end)
+        if not ok_jump then
+            logger.warn("ReadwiseReader:" .. context .. ": could not apply Reader position", err)
+            return
+        end
+        UIManager:show(InfoMessage:new{
+            text = string.format("Moved to your Readwise Reader position (about %d%%).", roundedPercent(percent)),
+            timeout = 3,
+        })
+    end)
+end
+
+-- Moves Reader forward to local_percent when this device is further ahead; a
+-- document marked finished here is sent as 100% (it stays on the device until
+-- the finished-articles archive action or setting removes it).
+-- document is Reader's fresh metadata when the caller already has it (sync's
+-- list); otherwise it is fetched, and only if the cheap no-network check says
+-- the position moved and the device is online. Reader is read right before
+-- the write so a position reached elsewhere is never overwritten. Also strips
+-- an old KOReader progress note line in the same request. Returns true when
+-- Reader was moved.
+function ReadwiseReader:pushReadingProgress(doc_id, local_percent, document, category, finished)
+    local state = self.progress_state[doc_id] or {}
+    local ready, reason = Progress.decidePush(local_percent, {
+        pushed_percent = state.pushed_percent,
+        finished = finished,
+        category = category or (document and document.category),
+    })
+    if not ready then
+        logger.dbg("ReadwiseReader:pushReadingProgress:", doc_id, "not sent -", reason)
+        return false
+    end
+
+    if not document then
+        if not NetworkMgr:isOnline() then
+            return false
+        end
+        local err, status
+        document, err, status = self.reader_api:getDocument(doc_id, false)
+        if not document then
+            logger.warn("ReadwiseReader:pushReadingProgress: could not read", doc_id, err, status)
+            return false
+        end
+    end
+
+    local remote = tonumber(document.reading_progress)
+    self:recordProgressState(doc_id, { remote_percent = remote })
+    local value
+    value, reason = Progress.decidePush(local_percent, {
+        pushed_percent = state.pushed_percent,
+        remote_percent = remote,
+        finished = finished,
+        category = document.category,
+    })
+    if not value then
+        logger.dbg("ReadwiseReader:pushReadingProgress:", doc_id, "not sent -", reason)
+        return false
+    end
+
+    local notes, had_note_line = ProgressNote.remove(document.notes)
+    local sent, err, status = self.reader_api:updateReadingProgress(doc_id, value,
+        had_note_line and notes or nil)
+    if not sent then
+        logger.warn("ReadwiseReader:pushReadingProgress: could not send", doc_id, err, status)
+        return false
+    end
+    self:recordProgressState(doc_id, { pushed_percent = value, remote_percent = value })
+    logger.dbg("ReadwiseReader:pushReadingProgress: sent", doc_id, "at", value)
+    return true
+end
+
+-- Close and sleep: send the open document's position. Never turns Wi-Fi on;
+-- when offline the next sync catches up.
+function ReadwiseReader:pushOpenDocumentProgress(trigger)
+    if not self.sync_reading_progress or not self:hasAccessToken() then
+        return
+    end
+    local filepath = self.ui and self.ui.document and self.ui.document.file
+    local doc_id, category = self:getReaderIdentity(filepath)
+    if not doc_id then
+        return
+    end
+    local ok, result = pcall(function()
+        local percent, finished = self:getCurrentLocalProgress(filepath)
+        return self:withFastRequests(function()
+            return self:pushReadingProgress(doc_id, percent, nil, category, finished)
+        end)
+    end)
+    if not ok then
+        logger.warn("ReadwiseReader:pushOpenDocumentProgress (" .. trigger .. "): failed", result)
+    elseif result then
+        self:saveSettings()
+    end
+end
+
+function ReadwiseReader:onCloseDocument()
+    if self.pending_pull then
+        UIManager:unschedule(self.pending_pull)
+        self.pending_pull = nil
+    end
+    self:pushOpenDocumentProgress("close")
+end
+
+function ReadwiseReader:onSuspend()
+    self:pushOpenDocumentProgress("suspend")
+end
+
+-- Seconds after opening before Reader is asked for its position: long enough
+-- for the first page to be drawn, short enough that little reading happens.
+local PULL_DELAY_SECONDS = 2
+
+-- The open document's page, to tell whether the user has turned a page since
+-- it opened. nil when KOReader doesn't say, in which case we jump as before.
+function ReadwiseReader:currentPageNumber()
+    local ok, page = pcall(function()
+        if self.ui.getCurrentPage then
+            return self.ui:getCurrentPage()
+        end
+        if self.ui.paging then
+            return self.ui.paging.current_page
+        end
+        return self.ui.document:getCurrentPage()
+    end)
+    return ok and page or nil
+end
+
+-- Shortly after a document opens: fetch Reader's position and move there if
+-- Reader is further ahead (Progress.decide). Only when already online. If the
+-- user has turned a page meanwhile, ask instead of moving them.
+function ReadwiseReader:pullProgressOnOpen(doc_id, filepath, page_at_open)
+    self.pending_pull = nil
+    if not self:isDocumentOpen(filepath) then
+        return
+    end
+    if not self:hasAccessToken() or not NetworkMgr:isOnline() then
+        return
+    end
+    local document, err, status = self:withFastRequests(function()
+        return self.reader_api:getDocument(doc_id, false)
+    end)
+    if not document then
+        logger.dbg("ReadwiseReader:pullProgressOnOpen: could not read", doc_id, err, status)
+        return
+    end
+    -- The request blocks, so the user may have closed the book meanwhile.
+    if not self:isDocumentOpen(filepath) then
+        return
+    end
+    local local_percent, sidecar_mtime = self:readLocalProgressState(filepath)
+    local seed, reason = Progress.decide(document, {
+        seen_last_opened_at = (self.progress_state[doc_id] or {}).last_opened_at,
+        local_percent = local_percent,
+        sidecar_mtime = sidecar_mtime,
+    })
+    self:recordProgressState(doc_id, {
+        last_opened_at = document.last_opened_at,
+        remote_percent = tonumber(document.reading_progress),
+    })
+    self:saveSettings()
+    if not seed then
+        logger.dbg("ReadwiseReader:pullProgressOnOpen:", doc_id, "not moved -", reason)
+        return
+    end
+
+    local page_now = self:currentPageNumber()
+    if page_at_open == nil or page_now == nil or page_now == page_at_open then
+        jumpToPercent(self.ui, seed.percent, "pullProgressOnOpen")
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        text = string.format("You read further in Readwise Reader (about %d%%).\n\nJump there?",
+            roundedPercent(seed.percent)),
+        ok_text = "Jump",
+        cancel_text = "Stay here",
+        ok_callback = function()
+            if self:isDocumentOpen(filepath) then
+                jumpToPercent(self.ui, seed.percent, "pullProgressOnOpen")
+            end
+        end,
+    })
+end
+
+-- Apply Reader's position when the document is opened: a seed recorded at
+-- sync if there is one (no network, so straight away), otherwise a fresh look
+-- at Reader once the first page is up. GotoPercent is used rather than the
+-- sidecar's last_percent because readerrolling honours last_percent only when
+-- last_xpointer is absent, and that branch is marked deprecated upstream.
 function ReadwiseReader:onReaderReady()
     if not self.sync_reading_progress then
         return
@@ -3752,34 +4468,81 @@ function ReadwiseReader:onReaderReady()
 
     local document = self.ui and self.ui.document
     local filepath = document and document.file
-    if not filepath then
+    local doc_id = self:getReaderIdentity(filepath)
+    if not doc_id then
         return
     end
 
-    local doc_id = self:getDocumentIdFromPath(filepath)
-    local percent = doc_id and tonumber(self.pending_progress_seeds[doc_id])
-    if not percent then
+    local percent = tonumber(self.pending_progress_seeds[doc_id])
+    if percent then
+        -- Cleared before the jump so a failure here cannot make the seed
+        -- replay on every open of this document.
+        self.pending_progress_seeds[doc_id] = nil
+        self:saveSettings()
+        jumpToPercent(self.ui, percent, "onReaderReady")
         return
     end
 
-    -- Cleared before the jump so a failure here cannot make the seed replay on
-    -- every open of this document.
-    self.pending_progress_seeds[doc_id] = nil
-    self:saveSettings()
-
-    UIManager:nextTick(function()
-        local ok_jump, err = pcall(function()
-            self.ui:handleEvent(Event:new("GotoPercent", percent * 100))
-        end)
-        if not ok_jump then
-            logger.warn("ReadwiseReader:onReaderReady: could not apply Reader position", err)
-            return
+    local page_at_open = self:currentPageNumber()
+    self.pending_pull = function()
+        local ok, err = pcall(function() self:pullProgressOnOpen(doc_id, filepath, page_at_open) end)
+        if not ok then
+            logger.warn("ReadwiseReader:onReaderReady: pull failed", err)
         end
-        UIManager:show(InfoMessage:new{
-            text = string.format("Moved to your Readwise Reader position (about %d%%).", percent * 100),
-            timeout = 3,
-        })
-    end)
+    end
+    UIManager:scheduleIn(PULL_DELAY_SECONDS, self.pending_pull)
+end
+
+-- Sync: send positions of linked books read since their last push. Their
+-- Reader documents are usually not in the sync list, so each is read first.
+function ReadwiseReader:pushLinkedBooksProgress()
+    local pushed = 0
+    for filepath in pairs(self.local_book_links or {}) do
+        local link = self:getLocalBookLink(filepath)
+        if link and lfs.attributes(filepath, "mode") == "file" then
+            local ok, result = pcall(function()
+                local local_percent, _, finished = self:readLocalProgressState(filepath)
+                return self:pushReadingProgress(link.id, local_percent, nil, link.category, finished)
+            end)
+            if not ok then
+                logger.warn("ReadwiseReader:pushLinkedBooksProgress: failed for", link.id, result)
+            elseif result then
+                pushed = pushed + 1
+            end
+        end
+    end
+    return pushed
+end
+
+-- One-time cleanup of the "KOReader progress: N%" note lines older versions
+-- wrote into linked books' Reader notes. Retried at later syncs until every
+-- linked document has been checked.
+function ReadwiseReader:cleanupProgressNotes()
+    if self.progress_notes_cleaned then
+        return
+    end
+    local done = true
+    for filepath in pairs(self.local_book_links or {}) do
+        local link = self:getLocalBookLink(filepath)
+        if link then
+            local document, err, status = self.reader_api:getDocument(link.id, false)
+            if document then
+                local notes, had_line = ProgressNote.remove(document.notes)
+                if had_line then
+                    local result, update_err, update_status = self:updateReaderDocumentNotes(document.id, notes)
+                    if not result and ReaderAPI.isRetryable(update_err, update_status) then
+                        done = false
+                    end
+                end
+            elseif ReaderAPI.isRetryable(err, status) then
+                done = false
+            end
+        end
+    end
+    if done then
+        self.progress_notes_cleaned = true
+        self:saveSettings()
+    end
 end
 
 function ReadwiseReader:synchronize()
@@ -3823,6 +4586,11 @@ function ReadwiseReader:runSynchronize()
     -- moment to retry any links queued while offline.
     self:flushPendingLinkSaves(false)
     self:flushPendingTagUpdates(false)
+    self:flushPendingNoteUpdates(false)
+    local ok_notes, notes_err = pcall(function() self:cleanupProgressNotes() end)
+    if not ok_notes then
+        logger.warn("ReadwiseReader:synchronize: progress note cleanup failed", notes_err)
+    end
 
     local sync_start_time = os.date("!%Y-%m-%dT%H:%M:%SZ")
     
@@ -3850,26 +4618,33 @@ function ReadwiseReader:runSynchronize()
     end
     
     self:showProgress("Getting document list…")
-    local documents = self:getDocumentList()
+    local documents, finished_documents = self:getDocumentList()
     
     if not documents then
         self:hideProgress()
         UIManager:show(InfoMessage:new{ text = "Failed to get document list from Readwise Reader." })
         return
     end
-    
+
+    -- Everything Reader still lists for this device, finished or not. Only
+    -- `documents` is downloaded; local copies of finished ones are kept.
+    local listed_documents = {}
+    for _, doc in ipairs(documents) do table.insert(listed_documents, doc) end
+    for _, doc in ipairs(finished_documents or {}) do table.insert(listed_documents, doc) end
+
     local previous_tags = self.document_tags
-    self:updateAvailableTags(documents)
+    self:updateAvailableTags(listed_documents)
+    self:cacheDocumentNotes(listed_documents)
 
     -- Remove local articles that no longer match server state
-    local reconciled_count = self:reconcileLocalDocuments(documents)
-    self:refreshLocalTags(documents, previous_tags)
+    local reconciled_count = self:reconcileLocalDocuments(listed_documents)
+    self:refreshLocalTags(listed_documents, previous_tags)
 
-    -- Move already-downloaded articles forward when Reader was read elsewhere.
+    -- Exchange positions for already-downloaded articles and linked books.
     -- Runs after reconciliation so a file about to be removed is never seeded.
     if self.sync_reading_progress then
-        self:showProgress("Checking Readwise Reader positions…")
-        self:reconcileReadingProgress(documents)
+        self:showProgress("Syncing reading positions…")
+        self:reconcileReadingProgress(listed_documents)
     end
 
     self:hideProgress()
@@ -4060,11 +4835,14 @@ function ReadwiseReader:saveSettings()
         max_articles_to_download = self.max_articles_to_download,
         sync_only_koreader_tag = self.sync_only_koreader_tag,
         sync_reading_progress = self.sync_reading_progress,
+        progress_notes_cleaned = self.progress_notes_cleaned,
         show_videos = self.show_videos,
         progress_state = self.progress_state,
         pending_progress_seeds = self.pending_progress_seeds,
         pending_link_saves = self.pending_link_saves,
         pending_tag_updates = self.pending_tag_updates,
+        document_notes = self.document_notes,
+        pending_note_updates = self.pending_note_updates,
         reader_placement_since = self.reader_placement_since,
         reader_highlight_records = self.reader_highlight_records,
     }
