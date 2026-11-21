@@ -73,6 +73,9 @@ function Reader.normalizeDocument(document)
         url = stringOrNil(document.url),
         parent_id = stringOrNil(document.parent_id),
         html_content = stringOrNil(document.html_content),
+        -- Only present when asked for with withRawSourceUrl: a presigned link
+        -- to the originally uploaded file, valid for one hour.
+        raw_source_url = stringOrNil(document.raw_source_url),
     }
 end
 
@@ -408,7 +411,9 @@ end
 -- `id` and `withHtmlContent` are documented LIST parameters. This is the only
 -- full-content request made by picker/search flows, and only happens after the
 -- user asks to download a document.
-function Reader:getDocument(document_id, with_html_content)
+-- with_raw_source adds the documented withRawSourceUrl parameter, for the
+-- original EPUB download.
+function Reader:getDocument(document_id, with_html_content, with_raw_source)
     if type(document_id) ~= "string" or document_id == "" then
         return nil, "invalid_document"
     end
@@ -418,6 +423,9 @@ function Reader:getDocument(document_id, with_html_content)
     local endpoint = "/list/?id=" .. queryEscape(document_id)
         .. "&withHtmlContent=" .. (with_html_content and "true" or "false")
         .. "&withTags=true&limit=1"
+    if with_raw_source then
+        endpoint = endpoint .. "&withRawSourceUrl=true"
+    end
     local response, err, status = self.request("GET", endpoint)
     if not response then
         return nil, err or "request_failed", status
@@ -432,6 +440,21 @@ function Reader:getDocument(document_id, with_html_content)
         end
     end
     return nil, "not_found"
+end
+
+-- A fresh presigned link to the document's original file. Asked for right
+-- before each download because the link expires after an hour. Returns the
+-- URL, or nil and "no_raw_source" when Reader has none to give (a document it
+-- cannot distribute), or the request error.
+function Reader:getRawSourceUrl(document_id)
+    local document, err, status = self:getDocument(document_id, false, true)
+    if not document then
+        return nil, err, status
+    end
+    if not document.raw_source_url then
+        return nil, "no_raw_source"
+    end
+    return document.raw_source_url
 end
 
 return Reader

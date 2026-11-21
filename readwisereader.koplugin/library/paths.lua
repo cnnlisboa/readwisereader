@@ -26,6 +26,32 @@ function Paths.getDocumentDirectory(document, settings)
     return Paths.getArticleDirectory(settings)
 end
 
+-- File types this plugin writes for Reader documents: generated HTML for
+-- articles (and books whose original is unavailable), and original EPUBs.
+local DOCUMENT_EXTENSIONS = { html = true, epub = true }
+
+function Paths.isDocumentFile(name)
+    local extension = type(name) == "string" and name:match("%.([%w]+)$")
+    return extension ~= nil and DOCUMENT_EXTENSIONS[extension:lower()] == true
+end
+
+function Paths.isEpubFile(name)
+    return type(name) == "string" and name:lower():match("%.epub$") ~= nil
+end
+
+-- When one Reader document has both an HTML copy and an EPUB on the device
+-- (only briefly, while an HTML copy is being replaced), the EPUB is the copy
+-- that represents it.
+function Paths.preferredDocumentPath(current, candidate)
+    if not current then
+        return candidate
+    end
+    if Paths.isEpubFile(candidate) and not Paths.isEpubFile(current) then
+        return candidate
+    end
+    return current
+end
+
 function Paths.getAllDocumentDirectories(settings)
     local directories, seen = {}, {}
     for _, directory in ipairs({ Paths.getArticleDirectory(settings), Paths.getBookDirectory(settings) }) do

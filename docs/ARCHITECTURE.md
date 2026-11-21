@@ -18,8 +18,8 @@ uses `NetworkMgr:runWhenOnline()` before `synchronize()` runs.
 | --- | --- |
 | Settings | `LuaSettings` stores the access token, directory, filters, sync options, last-sync timestamp, document tag/location maps, author/source URL lookup maps, cover URL cache index, and explicit local-file-to-Reader links. |
 | Authentication/API | `callAPI()` sends `Authorization: Token <token>` to Reader v3, retries Kindle `wantread`, and handles 429 `Retry-After`. `makeJsonRequest()` posts v2 highlight payloads. |
-| Document retrieval | Automatic sync's `getDocumentList()` pages `new`, `later`, and `shortlist` with HTML. `api/reader.lua` separately fetches 25-item metadata-only pages for the browser. `getArchivedDocuments()` pages archive changes. |
-| Files/content | `downloadDocument()` writes `[rw-id_<id>] <safe title>.html`, then best-effort applies a Reader cover. `processHtmlContent()` rewrites responsive markup, fetches inline images, base64-embeds them, and applies an image budget. Missing HTML produces a small fallback page. |
+| Document retrieval | Automatic sync's `getDocumentList()` pages `new`, `later`, and `shortlist` as metadata only; `downloadDocument()` fetches each new document's HTML (`fetchDocumentHtml`) or original EPUB link when it downloads it. `api/reader.lua` separately fetches 25-item metadata-only pages for the browser. `getArchivedDocuments()` pages archive changes. |
+| Files/content | `downloadDocument()` writes `[rw-id_<id>] <safe title>.epub` for EPUB-category documents (original file, see [Original EPUB downloads](#original-epub-downloads)) or `.html` otherwise, then best-effort applies a Reader cover to HTML. `processHtmlContent()` rewrites responsive markup, fetches inline images, base64-embeds them, and applies an image budget. Missing HTML produces a small fallback page. |
 | Metadata/sidecars | `setDocumentMetadata()` writes `doc_props` and `custom_props` through `DocSettings.openSettingsFile():flushCustomMetadata(filepath)`, then broadcasts metadata invalidation. |
 | Collections | Optional `ReadCollection` maps Reader location to `Readwise: <Location>` and batches writes. |
 | Highlights | KOReader history and Kindle My Clippings are parsed. `buildHighlightContext()` resolves the book-level fields from a downloaded Reader record or an explicit exact-local-path link; `api/highlights.lua` builds the payloads, batches them 100 per request, and reports what the server confirmed via `modified_highlights`. |
@@ -144,7 +144,8 @@ References: [DocSettings custom-cover code](https://github.com/koreader/koreader
 | Document list, title, author, source/site, summary, location, reading time, word count | Supported by current code | The list response is used, but not shown in a browser UI. |
 | Tags and category | Supported by current code | Used for filters and sidecar keywords. |
 | Cover/image URL | Official API, not implemented | List response includes `image_url`; use native custom covers. |
-| Full HTML/content | Supported by current code | `withHtmlContent=true`; Phase 1 should request it only per selected download. |
+| Full HTML/content | Supported by current code | `withHtmlContent=true`, requested per document only when it is downloaded (sync and picker alike). |
+| Original uploaded file | Supported by current code | Verified 2026-11-20: LIST with `withRawSourceUrl=true` returns a top-level `raw_source_url` string, a presigned `readwise-assets.s3.amazonaws.com` link valid for one hour, empty for non-distributable documents. For an uploaded EPUB it serves the original file (`application/octet-stream`, correct `Content-Length`). Used for EPUB-category documents. |
 | Original URL | Supported by current code | `source_url` is written to fallback HTML and stored for highlight export. |
 | Reading progress retrieval | Supported by current code | List returns `reading_progress` (0-1) plus `first_opened_at`, `last_opened_at`, `saved_at`, and `last_moved_at`. `library/progress.lua` decides when to move the device; `percent_finished` and a `GotoPercent` event apply it. |
 | Reading progress update | Supported by current code | Verified 2026-11-05: UPDATE and `bulk_update` accept `reading_progress` (0-1, the LIST scale), and Reader's apps open the document there. Not supported for PDFs. `Reader:updateReadingProgress` sends it; `Progress.decidePush` decides when. |
@@ -168,6 +169,56 @@ The public API documents token authentication, paginated list requests,
 optional HTML, `image_url`, metadata, `reading_progress`, update fields, tags,
 bulk update (including `reading_progress`), and delete. It does not document
 file uploads, Daily Digest, or search. See [Reader API](https://readwise.io/reader_api).
+
+## Original EPUB downloads
+
+Documents in Reader's `epub` category are downloaded as the uploaded file
+when `download_original_epubs` is on (default). `library/epub.lua` is pure
+apart from file I/O, with an injectable transport, and is tested without
+KOReader; `main.lua` holds the decisions (`downloadOriginalEpub`,
+`canReplaceHtmlWithEpub`, `findIdenticalLocalBook`), tested in
+`tests/test_epub_download.lua` with KOReader stubbed.
+
+- **Link.** `Reader:getRawSourceUrl` asks LIST for one document with
+  `withRawSourceUrl=true` right before the download, because links expire
+  after an hour. The picker asks for the link together with the document (and
+  without its HTML). A 400/403 from S3 on a link that was not fetched just now
+  triggers one fresh request. The Readwise token is never sent to S3, and logs
+  show the link's host only.
+- **Transfer.** Streamed to a hidden `.<name>.part` file in the destination
+  directory, with each chunk reported to `DownloadProgress:addBytes` (redraw
+  only; a Cancel takes effect at the next document). Kept only when the byte
+  count matches `Content-Length` and `Epub.validate` passes: ZIP local header,
+  end-of-central-directory record present (catches truncation), and either the
+  spec's leading `mimetype` entry naming `application/epub+zip` or a
+  `META-INF/container.xml` entry. Then renamed into place. Size cap 300 MB.
+- **Failures.** Retryable ones (network, 5xx/429, expired link, short transfer,
+  write errors) return `"failed"`, so the next sync tries again;
+  `epub_downloads[id].attempts` counts them and the third falls back to HTML.
+  Permanent ones (no `raw_source_url`, not an EPUB, too large) fall back to HTML
+  at once and are remembered as `unavailable`, so the link is not requested
+  again. Entries are pruned at sync for documents Reader no longer lists.
+- **Metadata.** An EPUB keeps its own cover (no Reader cover is installed) and
+  its own description, series and language: custom props override field by
+  field, so only title, authors and keywords are written.
+- **Replacing HTML copies.** At sync, an HTML copy of an `epub` document is
+  queued for replacement when it is not open, has no highlights/bookmarks, is
+  not finished, and has no progress (or only a Reader-seeded percent never read
+  here; the pending seed is keyed by id and carries over). In replace mode the
+  HTML is never rewritten; any EPUB failure keeps it (`"kept"`).
+  `retireReplacedHtml` removes it and its collection entries once the EPUB is
+  in place. If both files ever exist, `Paths.preferredDocumentPath` makes the
+  EPUB the one every lookup returns.
+- **Sideloaded twins.** After an EPUB downloads, a non-Reader `.epub` in the
+  same directory with identical bytes (`Epub.sameContents`, chunked) and no
+  existing link is linked to the Reader document (`local_book_links`) and the
+  download is deleted (`"linked"`). Identity is file contents, never the title.
+  `getLinkedReaderIds` (links whose file still exists) stops sync downloading a
+  linked document again and marks it downloaded in the browser.
+- **Progress.** A freshly written file is seeded with
+  `seedReadingProgress(document, path, true)`, which ignores the
+  `last_opened_at` already seen for an earlier copy, since a brand-new file has
+  no local position to protect.
 
 ## Download progress and cancellation
 

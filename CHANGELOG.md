@@ -7,6 +7,21 @@ v2.6 (via [Endle/readwisereader](https://github.com/Endle/readwisereader)). Vers
 ## [Unreleased]
 
 ### Added
+- **Books download as the original EPUB.** Documents Reader files under EPUB (books you uploaded)
+  now download as the uploaded `.epub`, through the Reader API's `withRawSourceUrl`, instead of
+  Reader's HTML rendering. Setting: **Settings → Download books as EPUB** (on by default). The file
+  is streamed to disk, checked to be a complete EPUB, and only then kept. If Reader has no original
+  file, the HTML version is used. A failed transfer is retried at the next sync, and the HTML
+  version is used after three failures. An expired download link is refreshed once automatically.
+  Reading position sync, highlight export and placement in Reader, tags, notes, collections,
+  archive cleanup and Browse Reader all work on EPUBs the same way as on articles.
+- An HTML copy of a book already on the device is replaced by its EPUB at the next sync, if it was
+  never read there (no progress, highlights, bookmarks or finished status). A Reader position
+  waiting for it carries over to the EPUB.
+- A downloaded EPUB that is byte-for-byte identical to a book you copied into the same folder
+  yourself is not kept as a second copy: your file is linked to Reader instead, keeping its
+  reading position and highlights. Sync never downloads a document again once a book on the device
+  is linked to it, and Browse Reader shows linked books as on the device.
 - **Edit tags** on a Reader document: hold a document in Browse Reader, Search Library or a view,
   then choose **Edit tags**. A full-screen picker lists every tag in your account; tap to tick or
   untick, or add a new one. The current tags are fetched fresh first, because Reader replaces the
@@ -32,6 +47,12 @@ v2.6 (via [Endle/readwisereader](https://github.com/Endle/readwisereader)). Vers
   Send queued note changes**), keeping both versions if Reader's changed.
 
 ### Changed
+- **Sync lists documents without their content** and fetches each document's HTML (or EPUB) only
+  when downloading it. Previously every sync downloaded the full text of every document in Inbox,
+  Later and Shortlist, including ones already on the device and whole books. Syncs are much
+  lighter on data and memory; a first sync of many new articles makes one request per article.
+- A newly downloaded document picks up its Reader position even if that position was already
+  seen for an earlier copy of the same document.
 - **Reading position now syncs both ways** for downloaded articles and linked books, using the
   `reading_progress` field Readwise Reader's API now accepts. The setting is renamed **Sync reading
   position with Readwise Reader** (still off by default, existing choice kept). Opening a document

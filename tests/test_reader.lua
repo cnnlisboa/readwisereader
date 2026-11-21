@@ -35,6 +35,37 @@ api:getDocument("reader-book-id")
 check("metadata fetch does not request HTML", endpoints[1]:find("withHtmlContent=false", 1, true) ~= nil, true)
 check("download fetch still requests HTML", endpoints[2]:find("withHtmlContent=true", 1, true) ~= nil, true)
 
+print("\n== Original EPUB link ==")
+local raw_endpoints = {}
+local raw_api = Reader:new{
+    request = function(_method, endpoint)
+        table.insert(raw_endpoints, endpoint)
+        return { results = { {
+            id = "book", title = "Book", category = "epub",
+            raw_source_url = "https://readwise-assets.s3.amazonaws.com/book.epub?sig=x",
+        } } }
+    end,
+}
+local link = raw_api:getRawSourceUrl("book")
+check("returns the presigned link", link, "https://readwise-assets.s3.amazonaws.com/book.epub?sig=x")
+check("asks for withRawSourceUrl", raw_endpoints[1]:find("withRawSourceUrl=true", 1, true) ~= nil, true)
+check("link request skips the HTML", raw_endpoints[1]:find("withHtmlContent=false", 1, true) ~= nil, true)
+check("plain fetch never asks for the link", endpoints[1]:find("withRawSourceUrl", 1, true), nil)
+local epub_doc = raw_api:getDocument("book", false, true)
+check("normalized document keeps the link", epub_doc.raw_source_url ~= nil, true)
+
+local empty_api = Reader:new{
+    request = function() return { results = { { id = "preview", title = "Preview", raw_source_url = "" } } } end,
+}
+local none, none_err = empty_api:getRawSourceUrl("preview")
+check("empty link means none", none, nil)
+check("empty link reason", none_err, "no_raw_source")
+
+local down_api = Reader:new{ request = function() return nil, "network_error" end }
+local _, down_err = down_api:getRawSourceUrl("book")
+check("request failure is passed through", down_err, "network_error")
+check("request failure is retryable", Reader.isRetryable(down_err), true)
+
 print("\n== Library search includes Feed ==")
 local search_page = {
     { id = "1", title = "Feed item", location = "feed" },

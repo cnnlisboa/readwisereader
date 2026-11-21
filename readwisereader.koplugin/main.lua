@@ -60,6 +60,7 @@ local socket = require("socket")
 local socketutil = require("socketutil")
 local util = require("util")
 local Covers = require("library/covers")
+local Epub = require("library/epub")
 local LocalLinks = require("library/local_links")
 local Paths = require("library/paths")
 local Progress = require("library/progress")
@@ -170,6 +171,13 @@ function ReadwiseReader:init()
     -- Covers are separate binary files managed by KOReader sidecars, not inline HTML images.
     self.download_covers = settings.download_covers == nil and true or settings.download_covers
     self.document_cover_urls = settings.document_cover_urls or {}
+
+    -- Reader documents in the "epub" category are downloaded as the original
+    -- uploaded EPUB (withRawSourceUrl) instead of Reader's HTML rendering.
+    self.download_original_epubs = settings.download_original_epubs ~= false
+    -- Per Reader id: { attempts = <retryable failures>, unavailable = true }
+    -- once Reader has no usable original. See downloadOriginalEpub.
+    self.epub_downloads = settings.epub_downloads or {}
 
     -- Reading position travels both ways and the furthest position wins (see
     -- library/progress.lua): opening a document pulls Reader's position,
@@ -565,6 +573,21 @@ function ReadwiseReader:linkLocalBookToReader(filepath, document)
     return link
 end
 
+-- Reader ids that a sideloaded book on this device is linked to. Sync does
+-- not download a second copy of those: the linked book already is the
+-- user's copy, and two files would push competing positions to one document.
+-- A link whose file is gone no longer counts.
+function ReadwiseReader:getLinkedReaderIds()
+    local ids = {}
+    for filepath in pairs(self.local_book_links or {}) do
+        local link = self:getLocalBookLink(filepath)
+        if link and lfs.attributes(filepath, "mode") == "file" then
+            ids[link.id] = true
+        end
+    end
+    return ids
+end
+
 function ReadwiseReader:removeLocalBookLink(filepath)
     if not LocalLinks.remove(self.local_book_links, filepath) then
         return false
@@ -610,11 +633,16 @@ function ReadwiseReader:setDocumentMetadata(filepath, document)
         logger.dbg("ReadwiseReader:setDocumentMetadata: set keywords:", props.keywords)
     end
 
-    if type(document.summary) == "string" and document.summary ~= "" then
+    -- An original EPUB carries its own description, series and language.
+    -- Custom props override field by field, so only the fields Reader owns
+    -- (title, author, tags) are set and the book's own metadata shows through.
+    local is_epub = Paths.isEpubFile(filepath)
+
+    if not is_epub and type(document.summary) == "string" and document.summary ~= "" then
         props.description = document.summary
     end
 
-    if type(document.site_name) == "string" and document.site_name ~= "" then
+    if not is_epub and type(document.site_name) == "string" and document.site_name ~= "" then
         props.series = document.site_name
     end
 
@@ -1592,6 +1620,20 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                         callback = function()
                             self.show_videos = not self.show_videos
+                            self:saveSettings()
+                        end,
+                    },
+                    {
+                        text = "Download books as EPUB",
+                        help_text = "Books you uploaded to Readwise Reader download as the original EPUB file, "
+                            .. "with its own layout, images and table of contents, instead of Reader's HTML version. "
+                            .. "If Reader has no original file for a book, the HTML version is used. "
+                            .. "HTML copies already on this device that were never opened are replaced at the next sync.",
+                        checked_func = function()
+                            return self.download_original_epubs
+                        end,
+                        callback = function()
+                            self.download_original_epubs = not self.download_original_epubs
                             self:saveSettings()
                         end,
                     },
@@ -2951,8 +2993,11 @@ function ReadwiseReader:getDocumentList()
                 local location_display = location == "new" and "Inbox" or (location:sub(1,1):upper() .. location:sub(2))
                 self:showProgress(string.format("Getting %s articles (%d kept)…", location_display, #documents))
 
-                -- Fetch with HTML content and tags for batch processing
-                local endpoint = "/list/?location=" .. location .. "&withHtmlContent=true&withTags=true"
+                -- Metadata only: content is fetched per document, and only for
+                -- the ones actually downloaded (downloadDocument). Asking for
+                -- HTML here would pull every listed document's full text,
+                -- whole books included, on every sync.
+                local endpoint = "/list/?location=" .. location .. "&withHtmlContent=false&withTags=true"
                 if self.sync_only_koreader_tag then
                     endpoint = endpoint .. "&tag=koreader"
                 end
@@ -3055,7 +3100,7 @@ function ReadwiseReader:forEachLocalDocument(callback)
     for _, directory in ipairs(self:getAllDocumentDirectories()) do
         if lfs.attributes(directory, "mode") == "directory" then
             for entry in lfs.dir(directory) do
-                if entry:match("%.html$") then
+                if Paths.isDocumentFile(entry) then
                     local filepath = directory .. entry
                     if lfs.attributes(filepath, "mode") == "file" then
                         local doc_id = self:getDocumentIdFromPath(filepath)
@@ -3072,12 +3117,25 @@ function ReadwiseReader:forEachLocalDocument(callback)
     end
 end
 
+-- The local copy of a Reader document, or nil. If an HTML copy and an EPUB
+-- are both present (briefly, while one replaces the other), the EPUB wins.
 function ReadwiseReader:findLocalDocumentByReadwiseId(readwise_id)
-    return self:forEachLocalDocument(function(doc_id, filepath)
+    local found
+    self:forEachLocalDocument(function(doc_id, filepath)
         if doc_id == readwise_id then
-            return filepath
+            found = Paths.preferredDocumentPath(found, filepath)
         end
     end)
+    return found
+end
+
+-- Reader id -> local path for every downloaded document, in one scan.
+function ReadwiseReader:getLocalDocumentPaths()
+    local paths = {}
+    self:forEachLocalDocument(function(doc_id, filepath)
+        paths[doc_id] = Paths.preferredDocumentPath(paths[doc_id], filepath)
+    end)
+    return paths
 end
 
 -- Which local files belong to documents archived on Readwise since the last sync.
@@ -3217,10 +3275,7 @@ end
 -- made in Reader. previous_tags is document_tags from before this sync's
 -- updateAvailableTags; only articles whose tag list changed are rewritten.
 function ReadwiseReader:refreshLocalTags(documents, previous_tags)
-    local local_paths = {}
-    self:forEachLocalDocument(function(doc_id, filepath)
-        local_paths[doc_id] = filepath
-    end)
+    local local_paths = self:getLocalDocumentPaths()
     local refreshed = 0
     for _, doc in ipairs(documents) do
         local filepath = local_paths[doc.id]
@@ -3277,59 +3332,162 @@ function ReadwiseReader:getDownloadedDocumentIds()
     self:forEachLocalDocument(function(doc_id)
         ids[doc_id] = true
     end)
+    -- A sideloaded book linked to Reader is this device's copy too.
+    for doc_id in pairs(self:getLinkedReaderIds()) do
+        ids[doc_id] = true
+    end
     return ids
 end
 
-function ReadwiseReader:downloadDocument(document, options)
-    options = options or {}
-    if not options.ignore_filters and self:shouldSkipDocument(document) then
-        logger.dbg("ReadwiseReader:downloadDocument: skipping", document.id, "- has excluded tags or location")
-        return "skipped"
+-- Retryable failures (network, throttling, an expired link) leave a book for
+-- the next sync. After this many in a row the HTML version is used instead, so
+-- a book that never gets through still arrives.
+local MAX_EPUB_ATTEMPTS = 3
+
+function ReadwiseReader:wantsOriginalEpub(document)
+    return self.download_original_epubs and type(document) == "table" and document.category == "epub"
+end
+
+function ReadwiseReader:documentFilePath(document, directory, extension)
+    local title = util.getSafeFilename(document.title or "Untitled", directory, 200, 0)
+    return directory .. article_id_prefix .. document.id .. article_id_postfix .. title .. "." .. extension
+end
+
+-- Downloads the original EPUB behind an "epub" document. Returns:
+--   "downloaded", filepath  the EPUB is in place
+--   "fallback", reason      Reader has no usable original: use the HTML
+--   "failed", reason        retryable; try again next sync
+--   "cancelled"
+function ReadwiseReader:downloadOriginalEpub(document, directory)
+    local id = document.id
+    local state = self.epub_downloads[id] or {}
+    if state.unavailable then
+        return "fallback", "original previously unavailable"
     end
-    
-    if not options.already_checked and self:documentExists(document.id) then
-        logger.dbg("ReadwiseReader:downloadDocument: skipping", document.id, "- already exists")
-        return "skipped"
+    if self.active_progress and self.active_progress:isCancelled() then
+        return "cancelled"
     end
-    
-    local directory = self:getDocumentDirectory(document)
-    if not directory or lfs.attributes(directory, "mode") ~= "directory" then
-        logger.warn("ReadwiseReader:downloadDocument: destination directory is unavailable for", document.id)
+
+    local function retryable(reason)
+        state.attempts = (state.attempts or 0) + 1
+        self.epub_downloads[id] = state
+        if state.attempts >= MAX_EPUB_ATTEMPTS then
+            logger.warn("ReadwiseReader:downloadOriginalEpub: giving up on the original for", id,
+                "after", state.attempts, "attempts:", reason)
+            return "fallback", reason
+        end
+        logger.warn("ReadwiseReader:downloadOriginalEpub: will retry", id, "next sync:", reason)
+        return "failed", reason
+    end
+    local function unavailable(reason)
+        logger.info("ReadwiseReader:downloadOriginalEpub: no usable original for", id, "-", reason)
+        self.epub_downloads[id] = { unavailable = true }
+        return "fallback", reason
+    end
+
+    -- A link handed in with the document is only seconds old (the browser
+    -- asks for it with the document); otherwise ask now, since links expire.
+    local url = document.raw_source_url
+    local fetched_now = false
+    local function fetchLink()
+        fetched_now = true
+        local link, err, status = self.reader_api:getRawSourceUrl(id)
+        if not link then
+            if err == "no_raw_source" or err == "not_found" then
+                return nil, unavailable("Reader returned no original file")
+            end
+            if ReaderAPI.isRetryable(err, status) then
+                return nil, retryable("link request failed: " .. tostring(err) .. " " .. tostring(status or ""))
+            end
+            return nil, unavailable("link request refused: " .. tostring(err) .. " " .. tostring(status or ""))
+        end
+        return link
+    end
+    if not url then
+        local link, status, reason = fetchLink()
+        if not link then
+            return status, reason
+        end
+        url = link
+    end
+    if not Epub.isDownloadableUrl(url) then
+        return unavailable("unsupported link")
+    end
+
+    local filepath = self:documentFilePath(document, directory, "epub")
+    local progress = self.active_progress
+    local function attempt(link)
+        logger.dbg("ReadwiseReader:downloadOriginalEpub: fetching", id, "from", Epub.describeUrl(link))
+        return Epub.download(link, filepath, {
+            on_bytes = progress and function(count) progress:addBytes(count) end or nil,
+        })
+    end
+
+    local ok, reason, http_code = attempt(url)
+    if not ok and Epub.isExpiredLinkStatus(http_code) and not fetched_now then
+        -- The link went stale between listing and downloading: one fresh try.
+        local link, status, link_reason = fetchLink()
+        if not link then
+            return status, link_reason
+        end
+        url = link
+        ok, reason, http_code = attempt(url)
+    end
+
+    if ok then
+        self.epub_downloads[id] = nil
+        logger.dbg("ReadwiseReader:downloadOriginalEpub: saved", id, "to", filepath)
+        return "downloaded", filepath
+    end
+    if Epub.isRetryable(reason) then
+        return retryable(reason)
+    end
+    return unavailable(reason)
+end
+
+-- Article HTML for a document that was listed without it (sync lists
+-- metadata only). Returns the HTML (possibly empty when Reader has none), or
+-- nil when the request failed and the download should be retried later.
+function ReadwiseReader:fetchDocumentHtml(document)
+    if type(document.html_content) == "string" and document.html_content ~= "" then
+        return document.html_content
+    end
+    local full, err, status = self.reader_api:getDocument(document.id, true)
+    if full then
+        return full.html_content or ""
+    end
+    if err == "not_found" then
+        return ""
+    end
+    logger.warn("ReadwiseReader:fetchDocumentHtml: could not fetch content for", document.id, err, status)
+    return nil
+end
+
+function ReadwiseReader:writeHtmlDocument(document, directory)
+    local content = self:fetchDocumentHtml(document)
+    if content == nil then
         return "failed"
     end
 
-    -- Store source identity before writing the local file, so the exporter can
-    -- still use it even when the generated HTML has no recoverable URL metadata.
-    self:storeAuthorMetadata(document.id, document.author)
-    self:storeSourceUrlMetadata(document.id, document.source_url)
-    self:storeReaderMetadata(document)
-
-    -- Get HTML content (already fetched in getDocumentList)
-    local content = document.html_content
-
-    if not content or content == "" or type(content) ~= "string" then
+    if content == "" then
         logger.warn("ReadwiseReader:downloadDocument: no HTML content available for", document.id)
 
-        local basic_content = string.format([[
+        content = string.format([[
 <h1>%s</h1>
 <p><strong>Author:</strong> %s</p>
 <p><strong>Source:</strong> <a href="%s">%s</a></p>
 <p><strong>Summary:</strong> %s</p>
 <p><strong>Note:</strong> Full content was not available via API. Please visit the source URL above.</p>
-]], 
+]],
             document.title or "Untitled",
             document.author or "Unknown",
             document.source_url or "",
             document.source_url or "",
             document.summary or "No summary available"
         )
-        
-        content = basic_content
     end
-    
-    local title = util.getSafeFilename(document.title or "Untitled", directory, 200, 0)
-    local filename = article_id_prefix .. document.id .. article_id_postfix .. title .. ".html"
-    local filepath = directory .. filename
+
+    local filepath = self:documentFilePath(document, directory, "html")
 
     -- The article text itself came over the wire from Readwise; images add to
     -- this as they are fetched inside processHtmlContent.
@@ -3345,67 +3503,201 @@ function ReadwiseReader:downloadDocument(document, options)
         logger.dbg("ReadwiseReader:downloadDocument: cancelled before writing", document.id)
         return "cancelled"
     end
-    
+
     local file, err = io.open(filepath, "w")
     if not file then
         logger.err("ReadwiseReader:downloadDocument: failed to open file for writing:", err)
         return "failed"
     end
-    
+
     local success = file:write(processed_content)
     file:close()
-    
-    if success then
-        logger.dbg("ReadwiseReader:downloadDocument: saved", document.id, "to", filepath)
 
-        -- Reader covers are cached separately and installed through KOReader's
-        -- native custom-cover sidecar support. A cover is always best-effort:
-        -- failure must not prevent metadata, collections, or the article itself.
-        if self.download_covers then
-            local cover_ok, cover_result = pcall(Covers.apply, document, filepath, {
-                cache_dir = directory .. ".readwise/covers",
-                cached_url = self.document_cover_urls[document.id],
-            })
-            if not cover_ok then
-                logger.warn("ReadwiseReader:downloadDocument: cover processing crashed for", document.id,
-                    cover_result)
-            elseif cover_result.cache_url then
-                self.document_cover_urls[document.id] = cover_result.cache_url
-                self:saveSettings()
-            end
-        end
-
-        -- Write metadata sidecar file for KOReader library integration
-        local status, err = pcall(function() self:setDocumentMetadata(filepath, document) end)
-        if not status then
-            logger.warn("ReadwiseReader:downloadDocument: metadata writing failed:", err)
-        end
-
-        -- Update KOReader collections
-        local coll_status, coll_err = pcall(function() self:updateDocumentCollections(filepath, document) end)
-        if not coll_status then
-            logger.warn("ReadwiseReader:downloadDocument: collection update failed:", coll_err)
-        end
-
-        -- Carry over an in-progress Reader position on a first download. Like
-        -- covers, this is best-effort: it must never fail the article itself.
-        if self.sync_reading_progress then
-            local seed_ok, seeded = pcall(function()
-                return self:seedReadingProgress(document, filepath)
-            end)
-            if not seed_ok then
-                logger.warn("ReadwiseReader:downloadDocument: progress seeding crashed for", document.id, seeded)
-            elseif seeded then
-                self:saveSettings()
-            end
-        end
-
-        return "downloaded"
-    else
+    if not success then
         logger.err("ReadwiseReader:downloadDocument: failed to write file")
         os.remove(filepath)
         return "failed"
     end
+    logger.dbg("ReadwiseReader:downloadDocument: saved", document.id, "to", filepath)
+    return "downloaded", filepath
+end
+
+-- Everything after the file itself: cover, Book Info metadata, collections
+-- and the Reader position. Each step is best-effort and never fails the
+-- download.
+function ReadwiseReader:finishDownloadedDocument(document, filepath, directory)
+    -- An original EPUB has its own cover, which KOReader reads from the file.
+    -- Generated HTML has none, so Reader's cover is installed through
+    -- KOReader's native custom-cover sidecar support.
+    if self.download_covers and not Paths.isEpubFile(filepath) then
+        local cover_ok, cover_result = pcall(Covers.apply, document, filepath, {
+            cache_dir = directory .. ".readwise/covers",
+            cached_url = self.document_cover_urls[document.id],
+        })
+        if not cover_ok then
+            logger.warn("ReadwiseReader:downloadDocument: cover processing crashed for", document.id,
+                cover_result)
+        elseif cover_result.cache_url then
+            self.document_cover_urls[document.id] = cover_result.cache_url
+            self:saveSettings()
+        end
+    end
+
+    -- Write metadata sidecar file for KOReader library integration
+    local status, err = pcall(function() self:setDocumentMetadata(filepath, document) end)
+    if not status then
+        logger.warn("ReadwiseReader:downloadDocument: metadata writing failed:", err)
+    end
+
+    -- Update KOReader collections
+    local coll_status, coll_err = pcall(function() self:updateDocumentCollections(filepath, document) end)
+    if not coll_status then
+        logger.warn("ReadwiseReader:downloadDocument: collection update failed:", coll_err)
+    end
+
+    -- Carry over an in-progress Reader position. The file is brand new, so
+    -- there is no local position to protect: Reader's applies even if it was
+    -- already seen for an earlier copy of this document.
+    if self.sync_reading_progress then
+        local seed_ok, seeded = pcall(function()
+            return self:seedReadingProgress(document, filepath, true)
+        end)
+        if not seed_ok then
+            logger.warn("ReadwiseReader:downloadDocument: progress seeding crashed for", document.id, seeded)
+        elseif seeded then
+            self:saveSettings()
+        end
+    end
+end
+
+-- options.ignore_filters   picker downloads bypass tag/location exclusions
+-- options.already_checked  the caller knows no local copy exists
+-- options.replace_path     an unopened HTML copy that an EPUB should replace;
+--                          the HTML is kept whenever the EPUB cannot be had
+-- Returns "downloaded", "skipped", "failed", "cancelled", "kept" (replace
+-- mode only: the HTML copy stays), or "linked" (the EPUB matched a book
+-- already on the device, which is now linked to Reader instead).
+function ReadwiseReader:downloadDocument(document, options)
+    options = options or {}
+    if not options.ignore_filters and self:shouldSkipDocument(document) then
+        logger.dbg("ReadwiseReader:downloadDocument: skipping", document.id, "- has excluded tags or location")
+        return "skipped"
+    end
+
+    if not options.already_checked and not options.replace_path and self:documentExists(document.id) then
+        logger.dbg("ReadwiseReader:downloadDocument: skipping", document.id, "- already exists")
+        return "skipped"
+    end
+
+    local directory = self:getDocumentDirectory(document)
+    if not directory or lfs.attributes(directory, "mode") ~= "directory" then
+        logger.warn("ReadwiseReader:downloadDocument: destination directory is unavailable for", document.id)
+        return "failed"
+    end
+
+    -- Store source identity before writing the local file, so the exporter can
+    -- still use it even when the generated HTML has no recoverable URL metadata.
+    self:storeAuthorMetadata(document.id, document.author)
+    self:storeSourceUrlMetadata(document.id, document.source_url)
+    self:storeReaderMetadata(document)
+
+    local status, filepath
+    if self:wantsOriginalEpub(document) then
+        status, filepath = self:downloadOriginalEpub(document, directory)
+        if options.replace_path then
+            if status ~= "downloaded" then
+                return status == "cancelled" and "cancelled" or "kept"
+            end
+            self:retireReplacedHtml(document.id, options.replace_path)
+        elseif status == "fallback" then
+            status = nil
+        elseif status ~= "downloaded" then
+            return status
+        else
+            local ok_twin, twin = pcall(self.findIdenticalLocalBook, self, filepath, directory)
+            if ok_twin and twin and self:linkLocalBookToReader(twin, document) then
+                os.remove(filepath)
+                logger.info("ReadwiseReader:downloadDocument: linked existing", twin, "to", document.id)
+                return "linked"
+            end
+        end
+    elseif options.replace_path then
+        return "kept"
+    end
+
+    if not status then
+        status, filepath = self:writeHtmlDocument(document, directory)
+        if status ~= "downloaded" then
+            return status
+        end
+    end
+
+    self:finishDownloadedDocument(document, filepath, directory)
+    return "downloaded"
+end
+
+-- A sideloaded book in the same folder with byte-identical contents is the
+-- same book the user uploaded to Reader. Identity is the file contents, never
+-- the title. Books already linked to some Reader document are left alone.
+function ReadwiseReader:findIdenticalLocalBook(epub_path, directory)
+    local size = lfs.attributes(epub_path, "size")
+    if not size then
+        return nil
+    end
+    local linked = {}
+    for filepath in pairs(self.local_book_links or {}) do
+        linked[filepath] = true
+    end
+    for entry in lfs.dir(directory) do
+        local candidate = directory .. entry
+        if Paths.isEpubFile(entry) and entry:sub(1, 1) ~= "." and candidate ~= epub_path
+            and not self:getDocumentIdFromPath(candidate) and not linked[candidate]
+            and lfs.attributes(candidate, "mode") == "file"
+            and lfs.attributes(candidate, "size") == size
+            and Epub.sameContents(candidate, epub_path) then
+            return candidate
+        end
+    end
+    return nil
+end
+
+-- An HTML copy is replaced by the original EPUB only when nothing on the
+-- device depends on it: never opened (or opened at the start and left), no
+-- highlights or bookmarks, not finished, not open now. A position seeded from
+-- Reader but never read here does not count, and carries over to the EPUB.
+function ReadwiseReader:canReplaceHtmlWithEpub(document, filepath)
+    if not self:wantsOriginalEpub(document) or Paths.isEpubFile(filepath) then
+        return false
+    end
+    local state = self.epub_downloads[document.id]
+    if state and (state.unavailable or (state.attempts or 0) >= MAX_EPUB_ATTEMPTS) then
+        return false
+    end
+    if self:isDocumentOpen(filepath) or self:hasLocalHighlights(filepath) then
+        return false
+    end
+    local percent, _mtime, finished = self:readLocalProgressState(filepath)
+    if finished then
+        return false
+    end
+    local seeded = tonumber(self.pending_progress_seeds[document.id])
+    return percent == nil or percent <= 0 or (seeded ~= nil and math.abs(percent - seeded) < 1e-6)
+end
+
+-- Removes the HTML copy an EPUB has just replaced, with its sidecar and its
+-- collection entries (the EPUB is added to the same collections afterwards).
+function ReadwiseReader:retireReplacedHtml(document_id, html_path)
+    if not self.modified_collections then
+        self:initCollectionTracking()
+    end
+    pcall(function() self:removeFromAllCollections(html_path) end)
+    self:saveCollections()
+    if not FileManager:deleteFile(html_path, true) then
+        -- Both copies stay; the EPUB is preferred wherever the id is looked up.
+        logger.warn("ReadwiseReader:retireReplacedHtml: could not delete", html_path)
+        return
+    end
+    logger.dbg("ReadwiseReader:retireReplacedHtml: replaced", html_path, "for", document_id)
 end
 
 -- Preserve the metadata maps consumed by the established sidecar, collection,
@@ -3478,17 +3770,22 @@ function ReadwiseReader:downloadReaderDocuments(documents)
             result.completed_ids[id] = true
             result.downloaded_ids[id] = true
         else
+            -- A book wanted as EPUB is fetched with its original-file link and
+            -- without the HTML, which is only requested if the EPUB is
+            -- unavailable (downloadDocument falls back on its own).
+            local as_epub = self:wantsOriginalEpub(metadata)
             local request_ok, document, request_err = pcall(
-                self.reader_api.getDocument, self.reader_api, id)
+                self.reader_api.getDocument, self.reader_api, id, not as_epub, as_epub)
             if not request_ok or not document then
                 logger.warn("ReadwiseReader:downloadReaderDocuments: full-content request failed for", id,
                     request_ok and request_err or document)
                 result.failed = result.failed + 1
             else
                 -- Keep useful list metadata when a malformed detail field was
-                -- omitted, without ever replacing the returned full HTML.
+                -- omitted, without ever replacing the returned full HTML or
+                -- the fresh original-file link.
                 for key, value in pairs(metadata) do
-                    if document[key] == nil and key ~= "html_content" then
+                    if document[key] == nil and key ~= "html_content" and key ~= "raw_source_url" then
                         document[key] = value
                     end
                 end
@@ -3503,6 +3800,12 @@ function ReadwiseReader:downloadReaderDocuments(documents)
                     result.failed = result.failed + 1
                 elseif status == "downloaded" then
                     result.downloaded = result.downloaded + 1
+                    result.completed_ids[id] = true
+                    result.downloaded_ids[id] = true
+                    local_ids[id] = true
+                elseif status == "linked" then
+                    -- The book was already here as a sideloaded copy.
+                    result.already_downloaded = result.already_downloaded + 1
                     result.completed_ids[id] = true
                     result.downloaded_ids[id] = true
                     local_ids[id] = true
@@ -4138,14 +4441,16 @@ end
 
 -- Records a seed for later application; never jumps directly, because the
 -- document is usually not open when sync runs.
-function ReadwiseReader:seedReadingProgress(document, filepath)
+-- fresh: the file was just downloaded, so Reader activity already seen for an
+-- earlier copy of the document is no reason to hold its position back.
+function ReadwiseReader:seedReadingProgress(document, filepath, fresh)
     if not self.sync_reading_progress then
         return false
     end
 
     local local_percent, sidecar_mtime, local_finished = self:readLocalProgressState(filepath)
     local seed, reason = Progress.decide(document, {
-        seen_last_opened_at = (self.progress_state[document.id] or {}).last_opened_at,
+        seen_last_opened_at = not fresh and (self.progress_state[document.id] or {}).last_opened_at or nil,
         local_percent = local_percent,
         sidecar_mtime = sidecar_mtime,
     })
@@ -4154,6 +4459,11 @@ function ReadwiseReader:seedReadingProgress(document, filepath)
         logger.dbg("ReadwiseReader:seedReadingProgress:", document.id, "not seeded -", reason)
         if reason == "remote document is finished" then
             self:markFinishedFromReader(document, filepath, local_finished, sidecar_mtime)
+        end
+        -- A seed still waiting from a copy this file replaced moves with it.
+        local pending = fresh and tonumber(self.pending_progress_seeds[document.id])
+        if pending then
+            self:writeSidecarPercent(filepath, pending)
         end
         -- Still record what Reader reported, so the next sync compares against
         -- this observation rather than re-evaluating the same activity.
@@ -4183,10 +4493,7 @@ function ReadwiseReader:reconcileReadingProgress(documents)
     end
 
     -- One directory scan for the whole pass, matching the browser's approach.
-    local local_paths = {}
-    self:forEachLocalDocument(function(doc_id, filepath)
-        local_paths[doc_id] = filepath
-    end)
+    local local_paths = self:getLocalDocumentPaths()
 
     -- Each article goes one way at most per sync: forward to Reader's
     -- position if Reader is ahead, otherwise Reader forward to this device's.
@@ -4651,12 +4958,31 @@ function ReadwiseReader:runSynchronize()
 
     local filtered_documents = {}
     local existing_count = 0
+    -- Reader id -> unopened HTML copy that the original EPUB should replace.
+    local replace_paths = {}
 
+    local local_paths = self:getLocalDocumentPaths()
+    local linked_ids = self:getLinkedReaderIds()
     for _, document in ipairs(documents) do
-        if self:documentExists(document.id) then
+        local existing = local_paths[document.id]
+        if linked_ids[document.id] and not existing then
             existing_count = existing_count + 1
-        else
+        elseif not existing then
             table.insert(filtered_documents, document)
+        elseif self:canReplaceHtmlWithEpub(document, existing) then
+            replace_paths[document.id] = existing
+            table.insert(filtered_documents, document)
+        else
+            existing_count = existing_count + 1
+        end
+    end
+
+    -- Forget EPUB attempt bookkeeping for documents Reader no longer lists.
+    local listed_ids = {}
+    for _, doc in ipairs(listed_documents) do listed_ids[doc.id] = true end
+    for doc_id in pairs(self.epub_downloads) do
+        if not listed_ids[doc_id] then
+            self.epub_downloads[doc_id] = nil
         end
     end
 
@@ -4677,6 +5003,9 @@ function ReadwiseReader:runSynchronize()
     end
     
     local downloaded = 0
+    local replaced = 0
+    local linked = 0
+    local kept = 0
     local skipped = 0
     local failed = 0
     local cancelled = false
@@ -4704,10 +5033,21 @@ function ReadwiseReader:runSynchronize()
             self:showProgress(string.format("Downloading %d of %d: %s", i, #filtered_documents, document.title))
         end
 
-        local result = self:downloadDocument(document)
+        local result = self:downloadDocument(document, {
+            already_checked = true,
+            replace_path = replace_paths[document.id],
+        })
 
-        if result == "downloaded" then
+        if result == "downloaded" and replace_paths[document.id] then
+            replaced = replaced + 1
+        elseif result == "downloaded" then
             downloaded = downloaded + 1
+        elseif result == "linked" then
+            linked = linked + 1
+        elseif result == "kept" then
+            -- The HTML copy stays; the EPUB is tried again next sync.
+            kept = kept + 1
+            existing_count = existing_count + 1
         elseif result == "skipped" then
             skipped = skipped + 1
         elseif result == "cancelled" then
@@ -4727,7 +5067,7 @@ function ReadwiseReader:runSynchronize()
     end
 
     if progress then
-        progress:update({ done = downloaded + skipped + failed, force = true })
+        progress:update({ done = downloaded + replaced + linked + kept + skipped + failed, force = true })
         progress:close()
     end
     self.active_progress = nil
@@ -4749,7 +5089,7 @@ function ReadwiseReader:runSynchronize()
 
     if cancelled then
         msg = msg .. "\n" .. string.format("Stopped after %d of %d article(s). Everything already downloaded was kept.",
-            downloaded, #filtered_documents)
+            downloaded + replaced, #filtered_documents)
     end
 
     if highlights_exported > 0 then
@@ -4758,6 +5098,14 @@ function ReadwiseReader:runSynchronize()
     
     if downloaded > 0 then
         msg = msg .. "\n" .. string.format("Downloaded: %d", downloaded)
+    end
+
+    if replaced > 0 then
+        msg = msg .. "\n" .. string.format("Replaced with original EPUB: %d", replaced)
+    end
+
+    if linked > 0 then
+        msg = msg .. "\n" .. string.format("Linked to books already on this device: %d", linked)
     end
     
     if existing_count > 0 then
@@ -4790,7 +5138,7 @@ function ReadwiseReader:runSynchronize()
         msg = msg .. "\n" .. string.format("Deleted locally: %d", deleted_count)
     end
     
-    if not cancelled and downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and reconciled_count == 0 and existing_count == 0 and highlights_exported == 0 and held_count == 0 then
+    if not cancelled and downloaded == 0 and replaced == 0 and linked == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and reconciled_count == 0 and existing_count == 0 and highlights_exported == 0 and held_count == 0 then
         msg = msg .. "\n" .. "No changes to process."
     end
     
@@ -4832,6 +5180,8 @@ function ReadwiseReader:saveSettings()
         max_image_size_mb = self.max_image_size_mb,
         download_covers = self.download_covers,
         document_cover_urls = self.document_cover_urls,
+        download_original_epubs = self.download_original_epubs,
+        epub_downloads = self.epub_downloads,
         max_articles_to_download = self.max_articles_to_download,
         sync_only_koreader_tag = self.sync_only_koreader_tag,
         sync_reading_progress = self.sync_reading_progress,
