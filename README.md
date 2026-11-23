@@ -7,6 +7,7 @@ A plugin for KOReader integration with the highlight saving and read later servi
 - **Browse Reader** lists your Inbox, Later and Shortlist, so you can pick individual articles to download instead of syncing everything.
 - **Search Library** searches titles, authors, sites, summaries and tags across Inbox, Later, Shortlist, Archive and Feed.
 - **Views** gives you Quick Reads (5 minutes or less), Long Reads (20 minutes or more) and In Progress, modelled on Reader's own smart views.
+- **Readwise Books shelves** lists the Reader books on each shelf (Currently reading, Want to read, Finished, Did not finish) so you can pick which to download.
 - **Highlights** lets you read your Readwise highlights on the device: browse by Books, Articles, Tweets or Podcasts, search them, or go through today's Daily Review. Highlights open full-screen with Previous/Next paging.
 - Downloaded articles get Reader's cover image as their KOReader cover (can be turned off).
 - Articles in Readwise Reader saved to “Inbox”, “Later” or “Shortlist” are downloaded to KOReader as HTML files.
@@ -45,6 +46,7 @@ Everything here works on metadata only, so it is quick and light on memory. Noth
 - Hold any document in the Reader browser and choose **Edit tags** to change its tags in Readwise Reader with a tag picker, or **Edit note** to edit its Reader note. If you are offline, the change is kept and sent at the next sync. In the Highlights viewer, **Edit tags** changes a highlight's tags (online only).
 - **Readwise Reader → Search Library** searches titles, authors, sites, summaries and tags across Inbox, Later, Shortlist, Archive and Feed. Reader's API has no search, so the plugin scans one page at a time; choose **Search next page** to keep going.
 - **Readwise Reader → Views** offers Quick Reads (5 minutes or less), Long Reads (20 minutes or more) and In Progress. These scan Inbox, Later, Shortlist and Archive, not Feed.
+- **Readwise Reader → Readwise Books shelves** shows each Readwise Books shelf with the books that are in Reader. Select books and download them; this works whatever the automatic download shelves are. Books on a shelf that aren't in Reader (paper, Kindle) are counted but can't be downloaded.
 - Podcasts and audiobooks never appear, because Reader only provides their show notes. Videos (YouTube transcripts) appear unless you turn off **Settings → Show videos when browsing**.
 
 ## Tags and notes for the document you're reading

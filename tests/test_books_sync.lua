@@ -223,5 +223,32 @@ n:addCandidateShelves(new_shelves, { "new3" })
 check("known-unmatched book: no new list", list_calls, 1)
 check("mapped book shelf comes from the Books step", new_shelves.new1, "currently_reading")
 
+print("== shelves for the Library browser ==")
+local SHELF_BOOKS = {
+    { id = 21, title = "Reading Now", author = "Ann Writer", status = "currently_reading" },
+    { id = 22, title = "Paper Only", author = "Cy Writer", status = "currently_reading" },
+    { id = 23, title = "Someday", author = "Bob Writer", status = "want_to_read" },
+    { id = 24, title = "Gone", author = "Dee Writer", status = "deleted" },
+}
+local s = newPlugin(SHELF_BOOKS, {})
+s.reader_api = { listEpubIdentities = function()
+    return {
+        { id = "d1", title = "Reading Now", author = "Ann Writer", location = "later", reading_progress = 0.4 },
+        { id = "d2", title = "Someday", author = "Bob Writer", location = "new" },
+    }
+end }
+local shelves_view = s:loadBooksShelves()
+check("reading shelf lists the Reader book", shelves_view.currently_reading.documents[1].id, "d1")
+check("listed as an EPUB", shelves_view.currently_reading.documents[1].category, "epub")
+check("keeps Reader location", shelves_view.currently_reading.documents[1].location, "later")
+check("book not in Reader counted", shelves_view.currently_reading.not_in_reader, 1)
+check("want to read shelf", shelves_view.want_to_read.documents[1].id, "d2")
+check("deleted books left out", shelves_view.deleted, nil)
+check("mapping remembered", s.books_ids.d1, 21)
+local failing = newPlugin(SHELF_BOOKS, {})
+failing.books_api.listAll = function() return nil, "network_error" end
+local none, shelf_err = failing:loadBooksShelves()
+check("list failure reported", none == nil and shelf_err, "network_error")
+
 print(failures == 0 and "\nall passed" or string.format("\n%d failure(s)", failures))
 os.exit(failures == 0 and 0 or 1)

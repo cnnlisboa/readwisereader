@@ -341,6 +341,9 @@ function ReadwiseReader:init()
         archive_document = function(document)
             return self:archiveFromBrowser(document)
         end,
+        load_shelves = function()
+            return self:loadBooksShelves()
+        end,
         edit_note = function(document)
             self:editReaderNote({ id = document.id, title = document.title })
         end,
@@ -1398,6 +1401,14 @@ function ReadwiseReader:addToMainMenu(menu_items)
                     .. "and Archive metadata so you can pick what to download. Nothing downloads automatically.",
                 sub_item_table_func = function()
                     return self.browser:getViewsMenuItems()
+                end,
+            },
+            {
+                text = "Readwise Books shelves",
+                help_text = "Your Readwise Books shelves, showing the books that are in Reader. "
+                    .. "Pick books to download them, whatever the automatic download setting.",
+                sub_item_table_func = function()
+                    return self.browser:getShelvesMenuItems()
                 end,
             },
             {

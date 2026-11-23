@@ -97,6 +97,36 @@ do
     check("view rebuild uses cached page", calls.view, 1)
 end
 
+-- Readwise Books shelves: one load for all shelves, rows selectable like any list.
+do
+    local browser = newBrowser()
+    local loads = 0
+    browser.load_shelves = function()
+        loads = loads + 1
+        return {
+            currently_reading = { documents = { { id = "b1", title = "Book", category = "epub" } }, not_in_reader = 2 },
+        }
+    end
+    local menu = browser:getShelvesMenuItems()
+    check("shelf label before load", menu[1].text_func(), "Currently reading")
+    local items = menu[1].sub_item_table_func()
+    check("shelf lists its book", findRow(items, "[ ] Book") ~= nil, true)
+    check("not-in-Reader note", findRow(items, "2 more on this shelf") ~= nil, true)
+    check("shelf count after load", browser:getShelvesMenuItems()[1].text_func(), "Currently reading (1)")
+    local empty = browser:getShelvesMenuItems()[2].sub_item_table_func()
+    check("empty shelf message", findRow(empty, "No Reader books") ~= nil, true)
+    check("shelves load once", loads, 1)
+    findRow(items, "[ ] Book").callback(nil)
+    check("shelf book selectable", browser:selectionCount(), 1)
+    findRow(items, "Refresh list").callback(nil)
+    check("refresh reloads shelves", loads, 2)
+
+    local failing = newBrowser()
+    failing.load_shelves = function() return nil, "network_error" end
+    local retry = failing:getShelvesMenuItems()[1].sub_item_table_func()
+    check("failed load offers retry", findRow(retry, "Retry") ~= nil, true)
+end
+
 -- Podcasts and audiobooks never list; videos list unless show_videos is off.
 do
     local show_videos = true

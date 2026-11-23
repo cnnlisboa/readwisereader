@@ -501,6 +501,56 @@ function BooksSync.install(R, deps)
         return shelves, report
     end
 
+    -- Readwise Books shelves for the Library browser: the Reader EPUB of
+    -- every book, grouped by shelf, so one can be picked for download.
+    -- Returns { [shelf] = { documents = {...}, not_in_reader = n } } or nil, err, status.
+    function R:loadBooksShelves()
+        local books, err, status = self.books_api:listAll()
+        if not books then return nil, err, status end
+        local identities, list_err, list_status = self.reader_api:listEpubIdentities()
+        if not identities then return nil, list_err, list_status end
+
+        local by_id = {}
+        for _, book in ipairs(books) do by_id[book.id] = book end
+        local matches, unmatched = BooksMap.matchBooks(identities, books)
+        for doc_id, book_id in pairs(matches) do self.books_ids[doc_id] = book_id end
+        self.books_unmatched = {}
+        for _, doc_id in ipairs(unmatched) do self.books_unmatched[doc_id] = true end
+        self.books_match_signature = tostring(#books)
+        self.books_last_list = { books = books, by_id = by_id }
+        self:saveSettings()
+
+        local result, in_reader = {}, {}
+        local function shelf(name)
+            result[name] = result[name] or { documents = {}, not_in_reader = 0 }
+            return result[name]
+        end
+        for _, identity in ipairs(identities) do
+            local book = by_id[matches[identity.id] or -1]
+            if book and book.status ~= "deleted" then
+                in_reader[book.id] = true
+                table.insert(shelf(book.status).documents, {
+                    id = identity.id,
+                    title = identity.title or book.title,
+                    author = identity.author or book.author,
+                    category = "epub",
+                    location = identity.location,
+                    reading_progress = identity.reading_progress,
+                })
+            end
+        end
+        for _, book in ipairs(books) do
+            if not in_reader[book.id] and book.status ~= "deleted" then
+                local entry = shelf(book.status)
+                entry.not_in_reader = entry.not_in_reader + 1
+            end
+        end
+        for _, entry in pairs(result) do
+            table.sort(entry.documents, function(a, b) return (a.title or "") < (b.title or "") end)
+        end
+        return result
+    end
+
     -- The shelf of each Reader book about to be downloaded. Matching above
     -- only covers books already on the device, so a new book is matched here
     -- (one Reader list request, skipped when every candidate was already

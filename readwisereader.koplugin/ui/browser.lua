@@ -100,6 +100,8 @@ function Browser:new(options)
         on_tags_changed = options.on_tags_changed,
         archive_document = options.archive_document,
         edit_note = options.edit_note,
+        load_shelves = options.load_shelves,
+        shelves = nil,
         link_search = nil,
     }, self)
 end
@@ -937,6 +939,81 @@ function Browser:getViewItems(view_key)
             end
         end,
     })
+    return items
+end
+
+-- Readwise Books shelves: each lists the Reader books on that shelf, to
+-- download like any other document. All shelves load in one go and stay
+-- cached until "Refresh list".
+local SHELVES = {
+    { key = "currently_reading", text = "Currently reading" },
+    { key = "want_to_read", text = "Want to read" },
+    { key = "finished", text = "Finished" },
+    { key = "did_not_finish", text = "Did not finish" },
+}
+
+function Browser:loadShelves()
+    if self.is_configured and not self.is_configured() then
+        self:showError("Configure your Readwise access token before browsing Reader.")
+        return nil
+    end
+    self.show_progress("Loading Readwise Books shelves…")
+    local ok, shelves, err, status = pcall(self.load_shelves)
+    self.hide_progress()
+    if not ok or not shelves then
+        self:showError(self:errorText(ok and err or nil, ok and status or nil, "load"))
+        return nil
+    end
+    self.shelves = shelves
+    return shelves
+end
+
+function Browser:getShelfItems(shelf_key)
+    local shelves = self.shelves or self:loadShelves()
+    local items
+    if not shelves then
+        items = {}
+    else
+        local entry = shelves[shelf_key] or { documents = {}, not_in_reader = 0 }
+        items = self:documentListItems(self:visibleDocuments(entry.documents), { show_location = true })
+        if #entry.documents == 0 then
+            table.insert(items, { text = "No Reader books on this shelf.", enabled = false })
+        end
+        if entry.not_in_reader > 0 then
+            table.insert(items, {
+                text = string.format("%d more on this shelf aren't in Reader (can't be downloaded).",
+                    entry.not_in_reader),
+                enabled = false,
+            })
+        end
+    end
+    table.insert(items, {
+        text = shelves and "Refresh list" or "Retry",
+        keep_menu_open = true,
+        callback = function(menu)
+            if self:loadShelves() and menu then
+                replaceMenuItems(menu, self:getShelfItems(shelf_key))
+            end
+        end,
+    })
+    return items
+end
+
+function Browser:getShelvesMenuItems()
+    self.downloaded_lookup = nil
+    local items = {}
+    for _, shelf in ipairs(SHELVES) do
+        local shelf_key = shelf.key
+        table.insert(items, {
+            text_func = function()
+                local entry = self.shelves and self.shelves[shelf_key]
+                return entry and string.format("%s (%d)", shelf.text, #entry.documents) or shelf.text
+            end,
+            sub_item_table_func = function()
+                return self:getShelfItems(shelf_key)
+            end,
+        })
+    end
     return items
 end
 
