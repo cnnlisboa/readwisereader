@@ -68,6 +68,8 @@ local ProgressNote = require("library/progress_note")
 local ReaderNote = require("library/reader_note")
 local TagFilter = require("library/tag_filter")
 local Ledger = require("library/highlight_ledger")
+local ReaderHighlightIds = require("library/reader_highlight_ids")
+local SyncModes = require("sync_modes")
 local ReaderAPI = require("api/reader")
 local HighlightsAPI = require("api/highlights")
 local ReaderHighlightsAPI = require("api/reader_highlights")
@@ -83,6 +85,7 @@ local API_ENDPOINT = "https://readwise.io/api/v3"
 local HIGHLIGHTS_API_ENDPOINT = "https://readwise.io/api/v2"
 local article_id_prefix = "[rw-id_"
 local article_id_postfix = "] "
+local article_id_suffix_start = " [rw-"
 
 -- Both JSON decoders represent null as a *truthy* sentinel (LuaJSON a function,
 -- rapidjson a lightuserdata), so `x or "default"` guards silently pass it through.
@@ -131,6 +134,26 @@ require("books_sync").install(ReadwiseReader, {
     Device = Device,
     util = util,
 })
+require("book_notes").install(ReadwiseReader, {
+    logger = logger,
+    lfs = lfs,
+    DataStorage = DataStorage,
+    json = rapidjson,
+})
+SyncModes.install(ReadwiseReader, {
+    logger = logger,
+    UIManager = UIManager,
+    InfoMessage = InfoMessage,
+    NetworkMgr = NetworkMgr,
+    Trapper = Trapper,
+    FileManager = FileManager,
+})
+require("finish_options").install(ReadwiseReader, {
+    DocSettings = DocSettings,
+    FileManager = FileManager,
+    UIManager = UIManager,
+    InfoMessage = InfoMessage,
+})
 require("highlight_tags").install(ReadwiseReader, {
     logger = logger,
     UIManager = UIManager,
@@ -143,9 +166,31 @@ function ReadwiseReader:onDispatcherRegisterActions()
     Dispatcher:registerAction("readwisereader_download", {
         category = "none",
         event = "SynchronizeReadwiseReader",
-        title = "Readwise Reader sync",
+        title = "Readwise Reader: sync all",
         general = true,
     })
+    Dispatcher:registerAction("readwisereader_reading_data", {
+        category = "none",
+        event = "SynchronizeReadwiseReadingData",
+        title = "Readwise Reader: sync reading data",
+        general = true,
+    })
+    Dispatcher:registerAction("readwisereader_books", {
+        category = "none",
+        event = "SynchronizeReadwiseBooks",
+        title = "Readwise Reader: sync books",
+        general = true,
+    })
+end
+
+function ReadwiseReader:onSynchronizeReadwiseReadingData()
+    self:startSync("reading")
+    return true
+end
+
+function ReadwiseReader:onSynchronizeReadwiseBooks()
+    self:startSync("books")
+    return true
 end
 
 function ReadwiseReader:init()
@@ -243,6 +288,9 @@ function ReadwiseReader:init()
     self.reader_highlight_records = settings.reader_highlight_records or {}
 
     self:initBooks(settings)
+    self:initFinishOptions(settings)
+    self:initSyncModes(settings)
+    self:initBookNotes(settings)
     -- Highlights already sent (library/highlight_ledger.lua). Filled from the
     -- Readwise export on first use, then checked for remote deletions.
     self.highlight_ledger = settings.highlight_ledger or {}
@@ -388,6 +436,19 @@ function ReadwiseReader:registerFileDialogButtons()
                 callback = function()
                     closeDialog()
                     self:editReaderNote(target)
+                end,
+            },
+            {
+                text = self:isKeptOnDevice(target.id) and _("Stop keeping on device") or _("Keep on device"),
+                callback = function()
+                    closeDialog()
+                    local keep = not self:isKeptOnDevice(target.id)
+                    self:setKeptOnDevice(target.id, keep, target.title)
+                    UIManager:show(InfoMessage:new{
+                        text = keep and _("Kept on this device: never deleted automatically.")
+                            or _("No longer kept on this device."),
+                        timeout = 2,
+                    })
                 end,
             },
         }
@@ -1217,7 +1278,7 @@ function ReadwiseReader:exportHighlights(only_ids)
 
     if only_ids then
         for title, booknotes in pairs(clippings) do
-            local doc_id = booknotes.file and self:getDocumentIdFromPath(booknotes.file)
+            local doc_id = booknotes.file and self:getReaderIdentity(booknotes.file)
             if not (doc_id and only_ids[doc_id]) then
                 clippings[title] = nil
             end
@@ -1276,8 +1337,18 @@ function ReadwiseReader:exportHighlights(only_ids)
             -- Reader placement runs first so a passage Reader refuses is
             -- already marked as a v2 fallback when the v2 export below runs.
             local records = self.reader_highlight_records[document_id] or {}
+            -- A highlight that came from another reader with its Reader id
+            -- is already in Reader: adopt it instead of placing a copy.
+            local annotations, save_annotations = self:annotationsForFile(booknotes.file)
+            local key_for = require("highlight_tags").keyForAnnotation
+            ReaderHighlightIds.adopt(annotations, records, key_for)
             local book_report = self.reader_highlights_api:exportBook(
                 document_id, context.title or "Untitled", booknotes, records, since)
+            local stamped = annotations and ReaderHighlightIds.stamp(annotations, records, key_for) or 0
+            if stamped > 0 then
+                save_annotations()
+                self.reader_ids_stamped = (self.reader_ids_stamped or 0) + stamped
+            end
             if next(records) then
                 self.reader_highlight_records[document_id] = records
                 placement_ran = true
@@ -1427,6 +1498,14 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = "Finished documents",
+                help_text = "What happens to documents you finish here, and which ones are never "
+                    .. "deleted automatically.",
+                sub_item_table_func = function()
+                    return self:getFinishMenuItems()
+                end,
+            },
+            {
                 text = "Automation",
                 help_text = "Choose for each automatic action: Automatic (runs on its own), Ask "
                     .. "(asks each time) or Manual (only from its menu entry). Use Ask or Manual "
@@ -1552,11 +1631,30 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 },
             },
             {
-                text = "Sync now",
+                text = "Sync reading data",
+                help_text = "Only documents already on this device, books first: reading positions, "
+                    .. "highlights and notes (to Readwise and to your other readers), highlight tags, "
+                    .. "book notes, and Readwise Books status and rating. Nothing is downloaded or deleted.",
+                callback = function()
+                    self:startSync("reading")
+                end,
+            },
+            {
+                text = "Sync books",
+                help_text = "Reading data for books, then books from your chosen Readwise Books shelves, "
+                    .. "uploads, and finished books.",
+                callback = function()
+                    self:startSync("books")
+                end,
+            },
+            {
+                text = "Sync all",
+                help_text = "Reading data, then books, then articles: everything Readwise Reader syncs.",
                 callback = function()
                     self.ui:handleEvent(Event:new("SynchronizeReadwiseReader"))
                 end,
             },
+            self:getAutoSyncMenuItem(),
             {
                 text = "Go to download folder",
                 callback = function()
@@ -2690,12 +2788,12 @@ function ReadwiseReader:getReaderTarget(filepath)
     local doc_id = self:getDocumentIdFromPath(filepath)
     if doc_id then
         local _dir, filename = util.splitFilePathName(filepath)
-        local title = filename:match("%] (.*)%.[^%.]+$") or filename
-        return { id = doc_id, title = title, filepath = filepath }
+        local title = filename:match("^(.*) %[rw%-[%w]+%]%.[^%.]+$") or filename:match("%] (.*)%.[^%.]+$") or filename
+        return { id = doc_id, title = title, filepath = filepath, is_book = self:isBookFile(doc_id, filepath) }
     end
     local link = self:getLocalBookLink(filepath)
     if link then
-        return { id = link.id, title = link.title, filepath = filepath }
+        return { id = link.id, title = link.title, filepath = filepath, is_book = self:isBookFile(link.id, filepath) }
     end
     return nil
 end
@@ -3522,9 +3620,11 @@ function ReadwiseReader:wantsOriginalEpub(document)
     return self.download_original_epubs and type(document) == "table" and document.category == "epub"
 end
 
+-- New downloads are "Title [rw-<id>].ext" so the title is what shows first.
+-- Older files keep "[rw-id_<id>] Title.ext"; getDocumentIdFromPath reads both.
 function ReadwiseReader:documentFilePath(document, directory, extension)
     local title = util.getSafeFilename(document.title or "Untitled", directory, 200, 0)
-    return directory .. article_id_prefix .. document.id .. article_id_postfix .. title .. "." .. extension
+    return directory .. title .. article_id_suffix_start .. document.id .. "]." .. extension
 end
 
 -- Downloads the original EPUB behind an "epub" document. Returns:
@@ -4458,20 +4558,24 @@ end
 
 function ReadwiseReader:getDocumentIdFromPath(filepath)
     local _, filename = util.splitFilePathName(filepath)
+    if type(filename) ~= "string" then
+        return nil
+    end
+    -- "Title [rw-<id>].ext" (current)
+    local id = filename:match(" %[rw%-([%w]+)%]%.[^.]+$")
+    if id then
+        return id
+    end
+    -- "[rw-id_<id>] Title.ext" (before 2026-11-23)
     local prefix_len = article_id_prefix:len()
-    
     if filename:sub(1, prefix_len) ~= article_id_prefix then
         return nil
     end
-    
     local endpos = filename:find(article_id_postfix, prefix_len + 1, true)
     if not endpos then
         return nil
     end
-    
-    local id = filename:sub(prefix_len + 1, endpos - 1)
-    logger.dbg("ReadwiseReader:getDocumentIdFromPath: extracted id", id, "from", filename)
-    return id
+    return filename:sub(prefix_len + 1, endpos - 1)
 end
 
 function ReadwiseReader:countFinishedDocuments()
@@ -4488,38 +4592,7 @@ function ReadwiseReader:countFinishedDocuments()
     return count
 end
 
--- Unconditional by design: the archive_finished toggle is checked by synchronize(),
--- so that the Advanced sync action can run this regardless of the setting.
-function ReadwiseReader:processFinishedDocuments()
-    local archived_count = 0
-    local deleted_count = 0
-    
-    self:forEachLocalDocument(function(doc_id, filepath)
-        if DocSettings:hasSidecarFile(filepath) then
-            local doc_settings = DocSettings:open(filepath)
-            local summary = doc_settings:readSetting("summary")
-            local status = summary and summary.status
-            
-            -- Highlights go first: archiving drops the Reader metadata their
-            -- export is placed with.
-            if status == "complete" and self:keepsOnDevice(doc_id, filepath) then
-                -- A kept book is archived in Reader once and stays here.
-                if not self.books_archived_kept[doc_id] and self:archiveDocument(doc_id) then
-                    self.books_archived_kept[doc_id] = true
-                    archived_count = archived_count + 1
-                end
-            elseif status == "complete" and self:highlightsSafeToRemove(filepath) then
-                if self:archiveDocument(doc_id) then
-                    archived_count = archived_count + 1
-                    FileManager:deleteFile(filepath, true)
-                    deleted_count = deleted_count + 1
-                end
-            end
-        end
-    end)
-    
-    return archived_count, deleted_count
-end
+-- processFinishedDocuments lives in finish_options.lua.
 
 -- ===============================================================================
 -- READING PROGRESS (READER TO DEVICE ONLY)
@@ -4531,6 +4604,32 @@ end
 
 -- True while the given file is the document currently open, in which case its
 -- sidecar belongs to ReaderUI and must not be written behind its back.
+-- KOReader's annotation list for a file and a function that saves it: the
+-- live list for the open document, otherwise the sidecar's. nil when the
+-- file has none.
+function ReadwiseReader:annotationsForFile(filepath)
+    if type(filepath) ~= "string" then return nil end
+    if self:isDocumentOpen(filepath) then
+        local annotation = self.ui.annotation
+        if annotation and type(annotation.annotations) == "table" then
+            return annotation.annotations, function()
+                pcall(function() annotation:onSaveSettings() end)
+            end
+        end
+        return nil
+    end
+    if not DocSettings:hasSidecarFile(filepath) then return nil end
+    local ok, doc_settings = pcall(DocSettings.open, DocSettings, filepath)
+    if not ok or not doc_settings then return nil end
+    local list = doc_settings:readSetting("annotations")
+    if type(list) ~= "table" then return nil end
+    return list, function()
+        doc_settings:saveSetting("annotations", list)
+        local flushed, err = pcall(function() doc_settings:flush() end)
+        if not flushed then logger.warn("ReadwiseReader: could not save Reader highlight ids", filepath, err) end
+    end
+end
+
 function ReadwiseReader:isDocumentOpen(filepath)
     local document = self.ui and self.ui.document
     return document ~= nil and document.file == filepath
@@ -4757,6 +4856,13 @@ function ReadwiseReader:hasAccessToken()
     return type(self.access_token) == "string" and self.access_token ~= ""
 end
 
+-- Device Sync asks this before moving a document's position or status: a
+-- Reader download or a book linked to Reader gets both from Readwise (when
+-- position sync is on), so Device Sync carries only its highlights and notes.
+function ReadwiseReader:ownsReadingPosition(filepath)
+    return self.sync_reading_progress == true and self:getReaderIdentity(filepath) ~= nil
+end
+
 local function jumpToPercent(ui, percent, context)
     UIManager:nextTick(function()
         local ok_jump, err = pcall(function()
@@ -4884,6 +4990,7 @@ function ReadwiseReader:onCloseDocument()
             logger.warn("ReadwiseReader:onCloseDocument: Readwise Books update failed", err)
         end
     end
+    self:scheduleAutoSync()
 end
 
 function ReadwiseReader:onSuspend()
@@ -5077,13 +5184,19 @@ function ReadwiseReader:cleanupProgressNotes()
     end
 end
 
-function ReadwiseReader:synchronize()
+-- mode: "reading" (Sync reading data), "books" (Sync books) or "all"
+-- (default, Sync all); see sync_modes.lua. quiet: automatic sync, no
+-- summary when nothing changed.
+function ReadwiseReader:synchronize(mode, quiet)
     -- The download loop blocks, so UIManager never gets to dispatch a Cancel
     -- tap unless the work runs in a coroutine that can yield back to it.
     -- Trapper:wrap also keeps the device awake and logs any error with a
     -- stacktrace, which a bare coroutine would swallow.
     if not coroutine.running() then
-        Trapper:wrap(function() self:synchronize() end)
+        Trapper:wrap(function() self:synchronize(mode, quiet) end)
+        return
+    end
+    if self.sync_running then
         return
     end
 
@@ -5091,7 +5204,14 @@ function ReadwiseReader:synchronize()
     -- removal must check highlights again.
     self.sync_highlights_ok = false
     self.removals_held = 0
-    local ok, err = pcall(self.runSynchronize, self)
+    self.sync_running = true
+    self.sync_quiet = quiet == true
+    local run = mode == "reading" and self.runReadingDataSync
+        or mode == "books" and self.runBooksSync
+        or self.runSynchronize
+    local ok, err = pcall(run, self)
+    self.sync_running = false
+    self.sync_quiet = false
     self.sync_highlights_ok = false
     if not ok then
         error(err, 0)
@@ -5099,84 +5219,37 @@ function ReadwiseReader:synchronize()
 end
 
 function ReadwiseReader:runSynchronize()
-    local info = InfoMessage:new{ text = "Connecting to Readwise Reader…" }
-    UIManager:show(info)
-    
+    local info = not self.sync_quiet and InfoMessage:new{ text = "Connecting to Readwise Reader…" } or nil
+    if info then UIManager:show(info) end
+
     if not self:validateSettings() then
-        UIManager:close(info)
+        if info then UIManager:close(info) end
         return
     end
-    
-    UIManager:close(info)
+
+    if info then UIManager:close(info) end
 
     -- Reset rate limiting for new sync session
     self.api_call_count = 0
     self.sync_start_time = nil
     self.needs_rate_limiting = false
 
-    -- Being here means we're online and configured, so this is also a good
-    -- moment to retry any links queued while offline.
-    self:flushPendingLinkSaves(false)
-    self:flushPendingTagUpdates(false)
-    self:flushPendingNoteUpdates(false)
-    local ok_notes, notes_err = pcall(function() self:cleanupProgressNotes() end)
-    if not ok_notes then
-        logger.warn("ReadwiseReader:synchronize: progress note cleanup failed", notes_err)
-    end
-
     local sync_start_time = os.date("!%Y-%m-%dT%H:%M:%SZ")
-    
-    -- Export highlights if enabled
-    local highlights_exported = 0
-    self.export_highlights_at_sync = self:automationMode("send_highlights") ~= "manual"
-    local export_now = false
-    self:runAutomated("send_highlights", "Send highlights to Readwise now?", function() export_now = true end)
-    if export_now then
-        local parse_err, export_failures
-        highlights_exported, parse_err, export_failures = self:exportHighlights()
-        self.sync_highlights_ok = not parse_err and export_failures == 0
-        if parse_err then
-            UIManager:show(InfoMessage:new{
-                text = string.format("Note: Highlight export failed, but continuing with article sync.\n%s",
-                    tostring(parse_err)),
-                timeout = 5
-            })
-        end
-    end
-    
-    -- Tags chosen while reading go on once their highlights exist remotely.
-    local tags_applied = 0
-    local has_pending_tags = false
-    for _, entry in pairs(self.highlight_tags) do
-        if entry.pending then has_pending_tags = true break end
-    end
-    if has_pending_tags then self:runAutomated("highlight_tags", "Apply highlight tags in Readwise?", function()
-        local ok_tags, result = pcall(function()
-            self:refreshReadwiseTagCache()
-            return self:applyPendingHighlightTags()
-        end)
-        if ok_tags then
-            tags_applied = result or 0
-        else
-            logger.warn("ReadwiseReader:synchronize: highlight tags failed", result)
-        end
-    end) end
+
+    -- Reading data first (positions, highlights, notes, Readwise Books),
+    -- then what Sync books and the articles add: downloads and removals.
+    local reading = self:syncReadingData()
+    local highlights_exported = reading.highlights or 0
+    local tags_applied = reading.tags or 0
+    local books_shelves, books_report = reading.books_shelves, reading.books_report
 
     local cleaned_count = self:cleanupArchivedDocuments()
-    
-    -- Readwise Books before finished documents are archived and deleted:
-    -- a finished book's status and rating must leave its sidecar first.
-    local books_shelves, books_report = self:syncReadwiseBooks()
+
     if books_report then
         local ok_uploads, uploads_result = pcall(function() return self:syncUploads() end)
         books_report.uploaded = ok_uploads and uploads_result or 0
         if not ok_uploads then
             logger.warn("ReadwiseReader:synchronize: uploads failed", uploads_result)
-        end
-        local ok_sessions, sessions_result = pcall(function() return self:syncSessions() end)
-        books_report.sessions = ok_sessions and sessions_result or 0
-        if not ok_sessions then
-            logger.warn("ReadwiseReader:synchronize: sessions failed", sessions_result)
         end
     end
 
@@ -5212,12 +5285,7 @@ function ReadwiseReader:runSynchronize()
     local reconciled_count = self:reconcileLocalDocuments(listed_documents)
     self:refreshLocalTags(listed_documents, previous_tags)
 
-    -- Exchange positions for already-downloaded articles and linked books.
-    -- Runs after reconciliation so a file about to be removed is never seeded.
-    if self.sync_reading_progress then
-        self:showProgress("Syncing reading positions…")
-        self:reconcileReadingProgress(listed_documents)
-    end
+    -- Positions were exchanged first, in syncReadingData.
 
     self:hideProgress()
 
@@ -5282,7 +5350,10 @@ function ReadwiseReader:runSynchronize()
                 held_by_mode = #books_to_get
             end
         end
-        filtered_documents = others
+        -- Books before articles.
+        filtered_documents = SyncModes.booksFirst(others, function(document)
+            return document.category == "epub"
+        end)
     end
 
     -- Forget EPUB attempt bookkeeping for documents Reader no longer lists.
@@ -5299,16 +5370,18 @@ function ReadwiseReader:runSynchronize()
         and reconciled_count == 0 and held_count == 0
         and not (books_report and (books_report.sent > 0 or books_report.applied > 0
             or (books_report.sessions or 0) > 0)) then
-        local msg = "No new articles found and no changes to process."
-        if existing_count > 0 then
-            msg = msg .. "\n" .. string.format("Skipped %d existing articles.", existing_count)
-        end
-        
         self:hideProgress()
-        UIManager:show(InfoMessage:new{ text = msg })
-        
         self.last_sync_time = sync_start_time
         self:saveSettings()
+        if #reading.lines > 0 then
+            self:showSyncSummary("Sync complete:", reading.lines)
+        elseif not self.sync_quiet then
+            local msg = "No new articles found and no changes to process."
+            if existing_count > 0 then
+                msg = msg .. "\n" .. string.format("Skipped %d existing articles.", existing_count)
+            end
+            UIManager:show(InfoMessage:new{ text = msg })
+        end
         return
     end
     
@@ -5402,11 +5475,9 @@ function ReadwiseReader:runSynchronize()
             downloaded + replaced, #filtered_documents)
     end
 
-    if highlights_exported > 0 then
-        msg = msg .. "\n" .. string.format("Exported highlights: %d", highlights_exported)
-    end
-    if tags_applied > 0 then
-        msg = msg .. "\n" .. string.format("Highlight tags applied: %d", tags_applied)
+    -- Positions, highlights, notes (syncReadingData).
+    for _, line in ipairs(reading.lines) do
+        msg = msg .. "\n" .. line
     end
     
     if downloaded > 0 then
@@ -5468,8 +5539,11 @@ function ReadwiseReader:runSynchronize()
     
     if not cancelled and downloaded == 0 and replaced == 0 and linked == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and reconciled_count == 0 and existing_count == 0 and highlights_exported == 0 and held_count == 0 then
         msg = msg .. "\n" .. "No changes to process."
+        if self.sync_quiet and #reading.lines == 0 then
+            return
+        end
     end
-    
+
     UIManager:show(InfoMessage:new{ text = msg })
     
     if FileManager.instance then
@@ -5478,9 +5552,7 @@ function ReadwiseReader:runSynchronize()
 end
 
 function ReadwiseReader:onSynchronizeReadwiseReader()
-    NetworkMgr:runWhenOnline(function()
-        self:synchronize()
-    end)
+    self:startSync("all")
     return true
 end
 
@@ -5529,6 +5601,9 @@ function ReadwiseReader:saveSettings()
         chapter_heading_level = self.chapter_heading_level,
     }
     self:booksSettingsForSave(settings)
+    self:finishSettingsForSave(settings)
+    self:syncModesSettingsForSave(settings)
+    self:bookNotesSettingsForSave(settings)
     self:highlightTagsSettingsForSave(settings)
     self.readwise_settings:saveSetting("readwisereader", settings)
     self.readwise_settings:flush()

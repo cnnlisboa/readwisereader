@@ -4,6 +4,7 @@ A plugin for KOReader integration with the highlight saving and read later servi
 > This is a fork of [tomtom800/readwisereader](https://github.com/tomtom800/readwisereader) (by way of [Endle/readwisereader](https://github.com/Endle/readwisereader)). It adds library browsing and search, Quick/Long Reads and In Progress views, an on-device highlights browser, Save to Readwise Later, and more. See the [CHANGELOG](CHANGELOG.md) for everything that changed. Fork versions start at 3.0.0 so they never clash with upstream releases. Please report bugs with this fork [here](https://github.com/cnnlisboa/readwisereader/issues), not upstream.
 
 ## Key features:
+- **Three syncs.** **Sync reading data** handles only what's already on the device, books first: reading positions, highlights and notes (to Readwise and, with Device Sync, to your other readers), highlight tags, book notes, and Readwise Books status and rating. Nothing is downloaded or deleted. **Sync books** adds books from your Readwise Books shelves, uploads and finished books. **Sync all** does everything, books before articles. **Sync after closing a book** runs one automatically when Wi-Fi is already on (Sync all by default).
 - **Browse Reader** lists your Inbox, Later and Shortlist, so you can pick individual articles to download instead of syncing everything.
 - **Search Library** searches titles, authors, sites, summaries and tags across Inbox, Later, Shortlist, Archive and Feed.
 - **Views** gives you Quick Reads (5 minutes or less), Long Reads (20 minutes or more) and In Progress, modelled on Reader's own smart views.
@@ -13,8 +14,9 @@ A plugin for KOReader integration with the highlight saving and read later servi
 - Articles in Readwise Reader saved to “Inbox”, “Later” or “Shortlist” are downloaded to KOReader as HTML files.
 - Books you uploaded to Readwise Reader download as the **original EPUB file** ("Download books as EPUB", on by default), with the book's own layout, images, cover and table of contents, into the Book download directory. If Reader has no original file for a book, its HTML version is used instead. An HTML copy of a book already on the device is replaced by the EPUB at the next sync, as long as it was never read (no progress, highlights or bookmarks). If the same EPUB is already on the device as a book you copied over yourself (identical file contents, not just the same title), no second copy is downloaded: your copy is linked to Reader, so its reading position and highlights sync like a downloaded book.
 - Images are downloaded where this is possible.
-- Articles which have been read in KOReader and marked as “finished” will be moved to the Readwise Reader Archive at the next sync, and deleted from KOReader ("Archive finished articles", on by default). Turn that off to keep finished articles and archive them yourself with **Advanced sync → Archive finished articles on Readwise**. An article you finish in Readwise Reader stays on the device until it is archived.
-- At sync, articles which have been archived in Readwise Reader will be deleted from KOReader.
+- **Finished documents** chooses what happens when you finish something: **When I finish** applies to articles only (the default), books only, all documents, or nothing; **Archive in Reader** and **Delete from this device** switch the two halves separately. Documents archived or removed in Reader follow the same choice. **Keep this document on device** (or **Keep on device** when holding a file) keeps any book or article from being deleted automatically. An article you finish in Readwise Reader stays on the device until it is archived.
+- Downloads are named `Title [rw-<id>].html` (or `.epub`), so the title comes first. Files downloaded earlier keep their `[rw-id_<id>] Title` names and still work.
+- **Book notes.** With Writer Deck installed, a book's Writer Deck note is kept the same as its Reader document note, both ways, at each sync. readwise-sync then puts it in your Obsidian book note. If both sides changed, both versions are kept under a ⚠ line.
 - Particular types of article, locations and document tags can be excluded from syncing in the settings menu. Exclusions ignore case and apply to an article in the same sync that brings it in.
 - Optionally, the plugin will only sync articles tagged as 'koreader' in Readwise (off by default).
 - The number of articles downloaded per sync can be limited in the settings menu (default: unlimited).
@@ -27,7 +29,7 @@ A plugin for KOReader integration with the highlight saving and read later servi
 - Very image heavy articles will download, but may cause KOReader to crash if the file is very large and your ereader can’t cope with this. Due to the way images are saved and the limitations of HTML files, this is more of an issue than with EPUBs. To mitigate this, there is a setting to allow the user to cap the size of a file, after which further images are not downloaded. This is set to 10MB by default, but may be changed according to the limits of the user’s setup. There is also a toggle to turn off image downloads completely if required.
 
 ## Limitations and Known Issues:
-- Highlights only travel from KOReader to Readwise. Highlights made in Readwise Reader are not brought into KOReader.
+- Highlights travel from KOReader to Readwise. Highlights made in Readwise Reader are not brought into KOReader. Between your own readers they travel through the Device Sync plugin (see below).
 - **Placing highlights in Reader** works for downloaded Reader articles and explicitly linked local books, and only for highlights made after you installed the version that added it (see the [CHANGELOG](CHANGELOG.md)). Older highlights may already be in Readwise from earlier exports, so they keep exporting the old way rather than appearing twice. Reader places a highlight by finding its exact passage; if it can't (for example, the text differs slightly between KOReader and Reader), the highlight is exported the old way, without a position, and the sync tells you how many. After a highlight is placed, only note changes are sent: Reader's API can't change a highlight's text, and deleting a highlight in KOReader does not delete it in Reader.
 - Highlights in books with no Reader link are not anchored inside any Reader document. Readwise groups them by title, author, and source URL.
 - Highlights exported the old way (not placed in Reader) carry a stable `highlight_url` derived from the annotation's creation time, so editing a highlight in KOReader updates it in Readwise on the next sync instead of adding a second copy. Readwise documents this update path for a highlight's *text*; whether it also revises an already-uploaded note is unverified.
@@ -99,7 +101,7 @@ With **Sync reading position with Readwise Reader** on, this happens automatical
 - **Readwise Books changes reach this device at sync.** A book set to *Finished* is marked finished here. *Did not finish* puts it on hold. With **Add Want to read books to To Be Read** on, *Want to read* adds it to the *To Be Read* collection.
 - **Finished is final.** Opening a finished book asks whether to start a re-read. Only a re-read moves it back to *Currently reading*.
 - **Download books on these shelves** chooses which Reader books are downloaded at sync. The default is *Currently reading* only, so a book uploaded for later stays off the device. Books already here are kept.
-- **Delete finished books automatically** applies to books only; articles are not affected. Turn it off to keep every book on the device. Or use **Keep current book on device** for single books.
+- Deleting finished books is set under **Finished documents** (books are kept unless you choose *Books only* or *All documents*).
 - **Reading sessions** come from KOReader's reading statistics and are posted to Readwise Books. If several devices share statistics, use **Post reading sessions from this device** on only one of them.
 - **Sideloaded EPUBs** added to the book folder are offered for upload to Readwise. Books already in the folder when this is first switched on are not offered. Use **Upload current book to Readwise** for those, or **Never upload this book** to stop being asked.
 - **Readwise tags…** in the highlight menu tags a highlight. The tags are applied in Readwise at the next sync.
@@ -118,6 +120,15 @@ Use Ask or Manual for anything that slows down opening a book. This covers readi
 
 Highlights are sent once. They are sent again only if you edit them on the device, and never after they were deleted in Readwise. On first use the plugin reads your Readwise export to learn what is already there. For books not linked to Reader, a heading highlight (`.h2`) is added for each chapter that has highlights.
 
+## Working with Device Sync
+
+[Device Sync](https://github.com/cnnlisboa/koreader-bridge/tree/main/device_sync.koplugin) keeps several readers in step through Google Drive and Todoist. With both installed, each plugin syncs what the other doesn't:
+
+- **Reading position and status** of documents downloaded from Reader or linked to it come from Readwise (when *Sync reading position with Readwise Reader* is on). Device Sync asks this plugin and leaves those documents alone. Every other book's position goes through Device Sync.
+- **Highlights, notes and bookmarks** go between readers through Device Sync, for every document. **Sync reading data** runs Device Sync's pass before sending highlights. A highlight placed in Reader carries its Reader id on the KOReader highlight, so the other reader recognises it and doesn't place it a second time.
+- **Files** downloaded from Reader never go through Drive; each reader downloads them itself. Books you copy on yourself go through Drive as before.
+- **Writer Deck notes** go through Device Sync. Book notes of Reader documents also go to Readwise (see Book notes above), so KOReader Bridge doesn't export them to Obsidian a second time.
+
 ## Installation:
 - Download `readwisereader-vX.Y.Z.zip` from the [latest release](https://github.com/cnnlisboa/readwisereader/releases/latest). Extract it.
 - Attach your ereader to your computer. Copy the `readwisereader.koplugin` folder containing _meta.lua and main.lua from the extracted folder to the `koreader/plugins` folder. If you had the upstream plugin installed, replace its folder; your settings are kept. Restart KOReader.
@@ -135,7 +146,7 @@ return {
     },
 }
 ```
-- Then choose **Readwise Reader → Sync now**.
+- Then choose **Readwise Reader → Sync all**.
 - By default, the extension will be added to the file menu with the prefix NEW:. The plugin will work in this format, but to remove the NEW: prefix and to move it to a different menu, add a line for  `"readwisereader",` in the appropriate place in koreader/frontend/ui/elements/filemanager_menu_order.lua
 
 ## Bug reporting

@@ -31,8 +31,8 @@ function BooksSync.install(R, deps)
     local SETTINGS_KEYS = {
         "books_sync_enabled", "books_ids", "books_state", "books_cache",
         "pending_books_updates", "automation_modes", "books_download_shelves",
-        "books_tbr", "books_tbr_collection", "delete_finished_books", "books_keep",
-        "books_archived_kept", "books_unmatched", "books_match_signature",
+        "books_tbr", "books_tbr_collection",
+        "books_unmatched", "books_match_signature",
         "books_sessions", "sessions_from_device", "sessions_gap_minutes", "sessions_min_minutes",
         "sessions_publish", "books_uploads", "books_upload_skip", "books_upload_baseline",
     }
@@ -55,11 +55,6 @@ function BooksSync.install(R, deps)
         self.books_download_shelves = settings.books_download_shelves or { currently_reading = true }
         self.books_tbr = settings.books_tbr ~= false
         self.books_tbr_collection = settings.books_tbr_collection or "To Be Read"
-        self.delete_finished_books = settings.delete_finished_books ~= false
-        -- Reader document id -> true: never deleted automatically.
-        self.books_keep = settings.books_keep or {}
-        -- Kept books already archived in Reader, so it happens once.
-        self.books_archived_kept = settings.books_archived_kept or {}
         -- Reader ids that matched no Books entry, retried when the library changes.
         self.books_unmatched = settings.books_unmatched or {}
         self.books_match_signature = settings.books_match_signature
@@ -163,13 +158,8 @@ function BooksSync.install(R, deps)
         return doc_id ~= nil and self.document_categories and self.document_categories[doc_id] == "epub"
     end
 
-    -- Whether automatic cleanup must leave this file alone (D.9).
-    function R:keepsOnDevice(doc_id, filepath)
-        if not self:isBookFile(doc_id, filepath) then
-            return false
-        end
-        return not self.delete_finished_books or (doc_id ~= nil and self.books_keep[doc_id] == true)
-    end
+    -- keepsOnDevice (whether automatic cleanup leaves a file alone) lives in
+    -- finish_options.lua.
 
     -- doc_id -> filepath for every local book with a Reader identity:
     -- downloaded EPUBs and linked sideloaded books.
@@ -1060,60 +1050,6 @@ function BooksSync.install(R, deps)
             callback = function()
                 self.books_tbr = not self.books_tbr
                 self:saveSettings()
-            end,
-        })
-        table.insert(items, {
-            text = "Delete finished books automatically",
-            help_text = "When off, books are never removed from this device by sync: not when "
-                .. "finished, archived, or removed in Reader. Articles keep their current behaviour.",
-            checked_func = function() return self.delete_finished_books end,
-            callback = function()
-                self.delete_finished_books = not self.delete_finished_books
-                self:saveSettings()
-            end,
-        })
-        table.insert(items, {
-            text = "Keep current book on device",
-            help_text = "This book is never deleted automatically, even when finished.",
-            enabled_func = function()
-                local book = self:getCurrentLocalBook()
-                return book ~= nil and self:getReaderIdentity(book.filepath) ~= nil
-            end,
-            checked_func = function()
-                local book = self:getCurrentLocalBook()
-                local doc_id = book and self:getReaderIdentity(book.filepath)
-                return doc_id ~= nil and self.books_keep[doc_id] == true
-            end,
-            callback = function()
-                local book = self:getCurrentLocalBook()
-                local doc_id = book and self:getReaderIdentity(book.filepath)
-                if not doc_id then return end
-                self.books_keep[doc_id] = not self.books_keep[doc_id] or nil
-                self:saveSettings()
-            end,
-        })
-        table.insert(items, {
-            text_func = function()
-                local count = 0
-                for _ in pairs(self.books_keep) do count = count + 1 end
-                return string.format("Books kept on device (%d)", count)
-            end,
-            sub_item_table_func = function()
-                local list = {}
-                for doc_id in pairs(self.books_keep) do
-                    local meta = self.reader_metadata and self.reader_metadata[doc_id]
-                    table.insert(list, {
-                        text = (meta and meta.title or doc_id) .. "  (tap to stop keeping)",
-                        callback = function()
-                            self.books_keep[doc_id] = nil
-                            self:saveSettings()
-                        end,
-                    })
-                end
-                if #list == 0 then
-                    table.insert(list, { text = "No books kept", enabled = false })
-                end
-                return list
             end,
         })
         table.insert(items, {

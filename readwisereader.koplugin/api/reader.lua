@@ -285,6 +285,35 @@ function Reader:listMetadata(location, cursor)
     return { documents = documents, next_cursor = next_cursor, result_count = result_count }
 end
 
+-- Top-level documents changed in Reader since `since` (ISO 8601), across
+-- every location. Moving the reading position bumps updated_at, so this is
+-- the cheap way to learn which positions moved elsewhere. Returns a list or
+-- nil, err, status.
+function Reader:listUpdatedSince(since, max_pages)
+    local documents, cursor = {}, nil
+    for _ = 1, max_pages or 20 do
+        local endpoint = "/list/?withHtmlContent=false&limit=100&updatedAfter=" .. queryEscape(since)
+        if cursor then
+            endpoint = endpoint .. "&pageCursor=" .. queryEscape(cursor)
+        end
+        local response, err, status = self.request("GET", endpoint)
+        if not response then
+            return nil, err or "request_failed", status
+        end
+        for _, document in ipairs(type(response.results) == "table" and response.results or {}) do
+            local normalized = Reader.normalizeDocument(document)
+            if normalized and not normalized.parent_id then
+                table.insert(documents, normalized)
+            end
+        end
+        cursor = stringOrNil(response.nextPageCursor)
+        if not cursor then
+            return documents
+        end
+    end
+    return documents
+end
+
 -- Locations scanned by search and by views (below). Feed is included: it is a
 -- documented, listable location and a user may reasonably want to search it,
 -- unlike views, which stay closer to "things you might download" and leave

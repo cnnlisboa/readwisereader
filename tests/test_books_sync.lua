@@ -90,6 +90,7 @@ end
 local function newPlugin(books, local_books)
     local self = setmetatable({}, { __index = ReadwiseReader })
     self:initBooks({ books_sync_enabled = true })
+    self:initFinishOptions({})
     self.books_api = newBooksApi(books)
     self.reader_api = { listEpubIdentities = function() return {} end }
     self.document_categories = {}
@@ -168,16 +169,33 @@ coroutine.wrap(function() p:syncReadwiseBooks() end)()
 check("asked once", #confirms, 1)
 check("sent after yes", p.books_api.patches[1] and p.books_api.patches[1].status, "currently_reading")
 
-print("\n== keep on device ==")
+print("\n== finish options and keep on device ==")
+local FinishOptions = require("finish_options")
 p.document_categories = { r1 = "epub" }
-check("books deleted by default", p:keepsOnDevice("a1", "/x/article.html"), false)
-check("book not kept by default", p:keepsOnDevice("r1", "/b/one.epub"), false)
-p.books_keep.r1 = true
-check("kept book", p:keepsOnDevice("r1", "/b/one.epub"), true)
-p.books_keep.r1 = nil
-p.delete_finished_books = false
-check("global off keeps every book", p:keepsOnDevice("r9", "/b/nine.epub"), true)
-check("articles still deletable", p:keepsOnDevice("a1", "/x/article.html"), false)
+check("default: articles only", p.finish_scope, "articles")
+check("books kept by default", p:keepsOnDevice("r1", "/b/one.epub"), true)
+check("articles deletable by default", p:keepsOnDevice("a1", "/x/article.html"), false)
+p.saveSettings = function() end
+p:setKeptOnDevice("a1", true, "Article")
+check("kept article", p:keepsOnDevice("a1", "/x/article.html"), true)
+p:setKeptOnDevice("a1", false)
+p.finish_scope = "books"
+check("books only: book deletable", p:keepsOnDevice("r1", "/b/one.epub"), false)
+check("books only: article kept", p:keepsOnDevice("a2", "/x/other.html"), true)
+p.finish_scope = "all"
+p.finish_delete = false
+check("delete off keeps everything", p:keepsOnDevice("a2", "/x/other.html"), true)
+p.finish_scope, p.finish_delete = "articles", true
+check("migrate: old delete-books on", FinishOptions.migrate({ delete_finished_books = true }).scope, "all")
+check("migrate: old keep list", FinishOptions.migrate({ books_keep = { r9 = true } }).keep.r9 ~= nil, true)
+local plan = FinishOptions.plan({ scope = "all", archive = true, delete = true }, true, true, false)
+check("kept: archived, not deleted", plan.archive and not plan.delete, true)
+plan = FinishOptions.plan({ scope = "all", archive = true, delete = true }, true, true, true)
+check("kept and archived: nothing more", plan.archive or plan.delete, false)
+plan = FinishOptions.plan({ scope = "articles", archive = true, delete = true }, true, false, false)
+check("out of scope: untouched", plan.archive or plan.delete, false)
+plan = FinishOptions.plan({ scope = "all", archive = false, delete = true }, false, false, false)
+check("delete without archive", not plan.archive and plan.delete, true)
 
 print("\n== open ==")
 local q = newPlugin({ { id = 5, status = "want_to_read" }, { id = 6, status = "finished" } }, {})
@@ -249,6 +267,85 @@ local failing = newPlugin(SHELF_BOOKS, {})
 failing.books_api.listAll = function() return nil, "network_error" end
 local none, shelf_err = failing:loadBooksShelves()
 check("list failure reported", none == nil and shelf_err, "network_error")
+
+print("\n== positions: only what changed, books first ==")
+local pos = newPlugin(BOOKS, {})
+pos.sync_reading_progress = true
+local asked_since
+pos.reader_api = { listUpdatedSince = function(_, since)
+    asked_since = since
+    return {
+        { id = "art1", category = "article" },
+        { id = "bk1", category = "epub" },
+        { id = "remote_only", category = "article" },
+    }
+end }
+pos.getLocalDocumentPaths = function()
+    return { art1 = "/a/[rw-id_art1] A.html", bk1 = "/b/B [rw-bk1].epub",
+        art2 = "/a/C [rw-art2].html", bk2 = "/b/D [rw-bk2].epub" }
+end
+local reconciled, pushed_order = nil, {}
+pos.reconcileReadingProgress = function(_, docs)
+    reconciled = {}
+    for _, d in ipairs(docs) do table.insert(reconciled, d.id) end
+    return 1, 0
+end
+pos.readLocalProgressState = function() return 0.5, 0, false end
+pos.pushReadingProgress = function(_, doc_id) table.insert(pushed_order, doc_id); return doc_id == "bk2" end
+local result = pos:syncLocalPositions()
+check("first check looks back 30 days", asked_since ~= nil, true)
+check("changed: book first", table.concat(reconciled, ","), "bk1,art1")
+check("unchanged: book first, changed ones skipped", table.concat(pushed_order, ","), "bk2,art2")
+check("counts", result.seeded .. "/" .. result.pushed, "1/1")
+check("checked time saved", pos.positions_checked_at ~= nil, true)
+pushed_order = {}
+pos:syncLocalPositions("books")
+check("books only: articles left out", table.concat(reconciled, ",") .. "|" .. table.concat(pushed_order, ","), "bk1|bk2")
+pos.sync_reading_progress = false
+check("off: nothing asked", pos:syncLocalPositions().pushed, 0)
+
+print("\n== sync reading data: order of steps ==")
+local rd = newPlugin(BOOKS, {})
+local order = {}
+local function mark(name, value) return function() table.insert(order, name); return value end end
+rd.flushPendingLinkSaves, rd.flushPendingTagUpdates, rd.flushPendingNoteUpdates = mark("queue"), function() end, function() end
+rd.cleanupProgressNotes = function() end
+rd.syncLocalPositions = mark("positions", { seeded = 0, pushed = 2 })
+local device_runs = 0
+rd.ui = { device_sync = { syncReadingDataQuietly = function()
+    device_runs = device_runs + 1
+    table.insert(order, "device" .. device_runs)
+    return { sent = 1, received = 0 }
+end } }
+rd.automationMode = function() return "auto" end
+rd.runAutomated = function(_, _, _, fn) fn() end
+rd.exportHighlights = function(self_, only)
+    table.insert(order, "highlights" .. (only and "(books)" or ""))
+    self_.reader_ids_stamped = 1
+    return 3, nil, 0
+end
+rd.highlight_tags = { k = { pending = true } }
+rd.refreshReadwiseTagCache = function() end
+rd.applyPendingHighlightTags = mark("tags", 1)
+rd.syncBookNotes = mark("book notes", { sent = 1, received = 0, conflicts = 0 })
+rd.syncReadwiseBooks = mark("books", { r1 = "currently_reading" })
+rd.syncSessions = mark("sessions", 0)
+rd.getLocalBooks = function() return { r1 = "/b/one.epub" } end
+local reading = rd:syncReadingData()
+check("order", table.concat(order, ","),
+    "queue,positions,device1,highlights,tags,book notes,books,device2")
+check("highlights counted", reading.highlights, 3)
+check("summary lines", #reading.lines, 5)
+order, device_runs = {}, 0
+rd.reader_ids_stamped = 0
+rd.exportHighlights = function(_, only) table.insert(order, "highlights" .. (only and "(books)" or "")); return 0, nil, 0 end
+rd:syncReadingData("books")
+check("books only: highlights limited, no second device pass", table.concat(order, ","),
+    "queue,positions,device1,highlights(books),tags,book notes,books")
+
+local SyncModes = require("sync_modes")
+check("booksFirst keeps order", table.concat(SyncModes.booksFirst({ "a1", "b1", "a2", "b2" },
+    function(x) return x:sub(1, 1) == "b" end), ","), "b1,b2,a1,a2")
 
 print(failures == 0 and "\nall passed" or string.format("\n%d failure(s)", failures))
 os.exit(failures == 0 and 0 or 1)

@@ -192,8 +192,10 @@ end
 local function book(id)
     return { id = id or "book1", title = "A Book", category = "epub", author = "Author" }
 end
-local EPUB_NAME = "[rw-id_book1] A Book.epub"
-local HTML_NAME = "[rw-id_book1] A Book.html"
+local EPUB_NAME = "A Book [rw-book1].epub"
+local HTML_NAME = "A Book [rw-book1].html"
+-- Files downloaded before the title-first names stay recognised.
+local OLD_HTML_NAME = "[rw-id_book1] A Book.html"
 
 local function serve(map)
     fake_http.requests = {}
@@ -304,7 +306,7 @@ check("missing content writes the summary page", rr:downloadDocument(article, { 
 
 print("\n== Replacing an unopened HTML copy ==")
 clearDir()
-local html_path = directory .. HTML_NAME
+local html_path = directory .. OLD_HTML_NAME
 local f = io.open(html_path, "w"); f:write("<p>old</p>"); f:close()
 serve({ [LINK] = { 200, EPUB_BYTES } })
 api = newApi({ links = { LINK } })
@@ -319,13 +321,13 @@ f = io.open(html_path, "w"); f:write("<p>old</p>"); f:close()
 rr = newPlugin(newApi({ links = { { err = "no_raw_source" } } }))
 check("no original: HTML copy kept", rr:downloadDocument(book(), { already_checked = true, replace_path = html_path }),
     "kept")
-check("HTML untouched, no duplicate", listDir(), HTML_NAME)
+check("HTML untouched, no duplicate", listDir(), OLD_HTML_NAME)
 check("not offered again", rr:canReplaceHtmlWithEpub(book(), html_path), false)
 
 rr = newPlugin(newApi({ links_default = { err = "network_error" } }))
 check("offline: HTML copy kept", rr:downloadDocument(book(), { already_checked = true, replace_path = html_path }),
     "kept")
-check("offline: still only HTML", listDir(), HTML_NAME)
+check("offline: still only HTML", listDir(), OLD_HTML_NAME)
 
 rr = newPlugin(newApi({}))
 check("an EPUB is never replaced", rr:canReplaceHtmlWithEpub(book(), directory .. EPUB_NAME), false)
@@ -368,7 +370,7 @@ f = io.open(sideloaded, "wb"); f:write(EPUB_BYTES:sub(1, -2) .. "X"); f:close()
 rr.local_book_links = {}
 rr.reader_api = newApi({ links = { LINK } })
 check("same size, different bytes: downloaded", rr:downloadDocument(book(), { already_checked = true }), "downloaded")
-check("both files kept", listDir(), "Claude Hopkins - A Book.epub | " .. EPUB_NAME)
+check("both files kept", listDir(), EPUB_NAME .. " | Claude Hopkins - A Book.epub")
 check("nothing linked", next(rr.local_book_links), nil)
 
 clearDir()
@@ -378,11 +380,22 @@ rr.reader_api = newApi({ links = { LINK } })
 check("a book linked elsewhere is left alone", rr:downloadDocument(book(), { already_checked = true }), "downloaded")
 check("its link is unchanged", rr.local_book_links[sideloaded].id, "other-doc")
 
+print("\n== Both filename formats ==")
+check("title-first name", rr:getDocumentIdFromPath("/x/A Book [rw-01jp1vwpn36ya6dgwpdqahmzg8].epub"),
+    "01jp1vwpn36ya6dgwpdqahmzg8")
+check("old prefix name", rr:getDocumentIdFromPath("/x/[rw-id_01kz5] Some [rw-ish] Article.html"), "01kz5")
+check("brackets in a plain title", rr:getDocumentIdFromPath("/x/Notes [draft].epub"), nil)
+check("partial download", rr:getDocumentIdFromPath("/x/.A Book [rw-b1].epub.part"), nil)
+check("ownsReadingPosition off without progress sync", rr:ownsReadingPosition("/x/A Book [rw-b1].epub"), false)
+rr.sync_reading_progress = true
+check("ownsReadingPosition for a Reader file", rr:ownsReadingPosition("/x/A Book [rw-b1].epub"), true)
+rr.sync_reading_progress = false
+
 print("\n== Local lookup with both copies ==")
 clearDir()
 f = io.open(html_path, "w"); f:write("x"); f:close()
 f = io.open(directory .. EPUB_NAME, "wb"); f:write(EPUB_BYTES); f:close()
-f = io.open(directory .. ".[rw-id_book2] B.epub.part", "wb"); f:write("partial"); f:close()
+f = io.open(directory .. ".B [rw-book2].epub.part", "wb"); f:write("partial"); f:close()
 rr = newPlugin(newApi({}))
 local paths = rr:getLocalDocumentPaths()
 check("EPUB represents the document", paths.book1, directory .. EPUB_NAME)

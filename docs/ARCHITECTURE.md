@@ -544,13 +544,25 @@ Implements `PLAN-readwise-books.md` (in the parent Repositories folder) on the K
 | `library/epub_upload.lua` | PUT of a local EPUB to the upload URL from Readwise Books. |
 | `books_sync.lua` | Installed onto `ReadwiseReader`: settings, open/close hooks, the sync step, sessions, uploads and menus. |
 | `highlight_tags.lua` | "Readwise tags…" in the highlight menu, and applying the tags at sync (Reader v3 for highlights placed in Reader, v2 tags otherwise). |
+| `sync_modes.lua` | Sync reading data / Sync books / Sync all, the targeted position pass (`listUpdatedSince`), the Device Sync step, and the automatic sync after closing a book. |
+| `finish_options.lua` | What finishing does (scope, archive, delete), `keepsOnDevice`, and Keep on device for any document. |
+| `book_notes.lua` | Keeps a Writer Deck book note (`readwise_id` in its meta line) the same as the Reader document note, three-way against the last synced text. |
+| `library/reader_highlight_ids.lua` | Writes the Reader highlight id onto the KOReader annotation after placing it, and adopts ids that arrive from another reader, so Device Sync's copy is never placed twice. |
+
+### Sync order
+
+Every sync starts with `syncReadingData`: queued edits, positions (only documents changed in Reader since `positions_checked_at`, plus local ones that moved; books first), Device Sync (highlights between readers, Writer Deck notes), highlights to Readwise, highlight tags, book notes, Readwise Books status and sessions, then Device Sync again if new Reader ids were written. Sync books then downloads shelf books, uploads, and processes finished books. Sync all runs the old full sync without its reading-data steps and downloads books before articles.
+
+### Files and Device Sync
+
+New downloads are `Title [rw-<id>].ext`; `getDocumentIdFromPath` also reads the old `[rw-id_<id>] Title.ext`. Device Sync skips both name forms for Drive transfers (`isReadwiseFile`) but still syncs their annotations, and asks `ownsReadingPosition(path)` before moving a position.
 
 Rules worth knowing before changing this:
 
 - **Obsidian is the source of truth.** The device only fills empty values in Readwise Books (dates, rating) and moves the shelf. `finished` is sticky except through the re-read question.
 - **A Readwise change is applied only when it differs from the shelf this device last saw** (`books_state[id].remote_status`). The first sync records a baseline instead of acting, so a book finished months ago is not deleted when the feature is switched on.
 - **Status and rating are pushed before finished documents are archived and deleted**, because the sidecar holding them goes with the file.
-- **Kept books** (`books_keep`, or **Delete finished books automatically** off) are protected in all three removal paths: finishing, archive cleanup, and reconciliation against the Reader list.
+- **Kept documents** (`keep_on_device`, or a kind the finish settings don't delete) are protected in all three removal paths: finishing, archive cleanup, and reconciliation against the Reader list (`keepsOnDevice` in `finish_options.lua`).
 - **The shelf filter applies to new downloads only.** Applying it to the Reader list would make reconciliation delete books already on the device.
 - **Highlights are filtered through the ledger before v2 export.** A re-sent deleted highlight is recreated by Readwise (verified 2026-11-23), so a ledger that can't be checked against Readwise means nothing is sent that sync.
 

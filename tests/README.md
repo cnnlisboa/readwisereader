@@ -10,6 +10,7 @@ never touch a real Readwise account.
 
 Run them from the repository root with the same runtime KOReader ships:
 
+    luajit tests/test_book_notes.lua
     luajit tests/test_books.lua
     luajit tests/test_books_sync.lua
     luajit tests/test_browser.lua
@@ -23,6 +24,7 @@ Run them from the repository root with the same runtime KOReader ships:
     luajit tests/test_progress.lua
     luajit tests/test_progress_note.lua
     luajit tests/test_reader.lua
+    luajit tests/test_reader_highlight_ids.lua
     luajit tests/test_reader_highlights.lua
     luajit tests/test_reader_note.lua
     luajit tests/test_tag_filter.lua

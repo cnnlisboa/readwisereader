@@ -7,6 +7,24 @@ v2.6 (via [Endle/readwisereader](https://github.com/Endle/readwisereader)). Vers
 ## [Unreleased]
 
 ### Added
+- **Three syncs**: Sync reading data (only what's on the device: positions, highlights, notes, tags,
+  book notes, Readwise Books status; books first), Sync books, and Sync all. Reading positions are
+  checked first and only for documents changed in Reader since the last check. **Sync after closing
+  a book** runs one automatically when Wi-Fi is already on. Gesture actions for each.
+- **Finished documents**: finishing archives and deletes articles only, books only, all documents or
+  nothing, with Archive and Delete as separate switches. **Keep on device** for any document, from
+  the menu or by holding the file. Replaces "Delete finished books automatically" and the book-only
+  keep list (both carried over).
+- **Book notes**: a Writer Deck book note is kept the same as the Reader document note, both ways.
+- **Device Sync**: positions of Reader documents are left to this plugin, Reader downloads stay out
+  of Drive, highlights placed in Reader carry their Reader id so the other reader doesn't place them
+  again, and Sync reading data runs Device Sync's pass.
+- **Readwise Books shelves** in the Library browser, and new books on the chosen shelves now
+  download (they were held back until already on the device).
+
+### Changed
+- New downloads are named `Title [rw-<id>].ext` instead of `[rw-id_<id>] Title.ext`. Existing files
+  keep their names.
 - **Books download as the original EPUB.** Documents Reader files under EPUB (books you uploaded)
   now download as the uploaded `.epub`, through the Reader API's `withRawSourceUrl`, instead of
   Reader's HTML rendering. Setting: **Settings → Download books as EPUB** (on by default). The file
