@@ -129,14 +129,15 @@ function BookNotes.install(R, deps)
     end
 
     -- Runs in syncReadingData. kinds = "books": only notes of local books.
+    -- only_doc: just that Reader document (quick sync after closing a book).
     -- Returns { sent, received, conflicts }.
-    function R:syncBookNotes(kinds)
+    function R:syncBookNotes(kinds, only_doc)
         local report = { sent = 0, received = 0, conflicts = 0 }
         local notes = self:listWriterDeckBookNotes()
         if next(notes) == nil then return report end
         local books = kinds == "books" and self:localBookIds() or nil
         for doc_id, note in pairs(notes) do
-            if not books or books[doc_id] then
+            if (not books or books[doc_id]) and (not only_doc or only_doc == doc_id) then
                 local document, err, status = self.reader_api:getDocument(doc_id, false)
                 if not document then
                     logger.warn("ReadwiseReader:syncBookNotes: could not read", doc_id, err, status)

@@ -15,11 +15,21 @@
 -- Each step runs on its own: one that fails is logged and the next runs.
 local SyncModes = {}
 
+-- What runs a few seconds after a book closes.
 SyncModes.AUTO_MODES = {
-    { "off", "Off" },
+    { "book", "That book only (quick)" },
     { "reading", "Reading data" },
     { "all", "Everything (Sync all)" },
+    { "off", "Off" },
 }
+
+SyncModes.PAGE_SYNC_EVERY = 10
+SyncModes.PAGE_SYNC_MIN_SECONDS = 60
+SyncModes.TAG_CACHE_SECONDS = 24 * 3600
+SyncModes.BOOKS_MIN_SECONDS = 5 * 60
+-- Reader locations positions are checked in. Feed is left out: it changes
+-- constantly and nothing there is downloaded.
+SyncModes.POSITION_LOCATIONS = { "new", "later", "shortlist", "archive" }
 
 -- Documents first by kind: books, then the rest, each in a stable order.
 function SyncModes.booksFirst(list, is_book)
@@ -43,25 +53,42 @@ function SyncModes.install(R, deps)
     local Trapper = deps.Trapper
     local FileManager = deps.FileManager
 
+    -- One step of a sync: errors are logged and the next step runs. How
+    -- long each step took goes to the log, to find what is slow on a device.
     local function step(name, fn)
-        local ok, result, extra = pcall(fn)
-        if not ok then
-            logger.warn("ReadwiseReader: sync step failed:", name, result)
+        local started = os.time()
+        local results = { pcall(fn) }
+        logger.info("ReadwiseReader: sync step", name, "took", os.time() - started, "s")
+        if not results[1] then
+            logger.warn("ReadwiseReader: sync step failed:", name, results[2])
             return nil
         end
-        return result, extra
+        return unpack(results, 2, table.maxn(results))
     end
 
     function R:initSyncModes(settings)
         -- When Reader positions were last checked; documents changed in
         -- Reader since then are the only ones fetched.
         self.positions_checked_at = settings.positions_checked_at
-        self.auto_sync_mode = settings.auto_sync_mode or "all"
+        -- When highlights were last exported in full: only sidecars changed
+        -- since are read next time.
+        self.highlights_parsed_at = settings.highlights_parsed_at
+        self.tag_cache_refreshed_at = settings.tag_cache_refreshed_at
+        self.books_synced_at = settings.books_synced_at
+        -- "book" (default), "reading", "all" or "off". A new key: an earlier
+        -- build saved "all" as auto_sync_mode.
+        self.close_sync_mode = settings.close_sync_mode or "book"
+        self.page_sync = settings.page_sync ~= false
     end
 
     function R:syncModesSettingsForSave(settings)
         settings.positions_checked_at = self.positions_checked_at
-        settings.auto_sync_mode = self.auto_sync_mode
+        settings.highlights_parsed_at = self.highlights_parsed_at
+        settings.tag_cache_refreshed_at = self.tag_cache_refreshed_at
+        settings.books_synced_at = self.books_synced_at
+        settings.close_sync_mode = self.close_sync_mode
+        settings.page_sync = self.page_sync
+        settings.auto_sync_mode = nil
         return settings
     end
 
@@ -77,10 +104,19 @@ function SyncModes.install(R, deps)
         if not self.sync_reading_progress then return { seeded = 0, pushed = 0 } end
         local started = os.time()
         local since = self.positions_checked_at or iso(started - 30 * 86400)
-        local changed, err, status = self.reader_api:listUpdatedSince(since)
-        if not changed then
-            logger.warn("ReadwiseReader:syncLocalPositions: list failed", err, status)
-            return nil, err
+        local changed, seen = {}, {}
+        for _, location in ipairs(SyncModes.POSITION_LOCATIONS) do
+            local list, err, status = self.reader_api:listUpdatedSince(since, nil, location)
+            if not list then
+                logger.warn("ReadwiseReader:syncLocalPositions: list failed", location, err, status)
+                return nil, err
+            end
+            for _, document in ipairs(list) do
+                if not seen[document.id] then
+                    seen[document.id] = true
+                    table.insert(changed, document)
+                end
+            end
         end
         local local_paths = self:getLocalDocumentPaths()
         local function isBook(doc_id) return self:isBookFile(doc_id, local_paths[doc_id]) end
@@ -180,7 +216,16 @@ function SyncModes.install(R, deps)
         if export_now then
             self.reader_ids_stamped = 0
             local only = kinds == "books" and self:localBookIds() or nil
-            local exported, parse_err, failures = self:exportHighlights(only)
+            -- Only sidecars changed since the last full export are read; a
+            -- books-only export reads them too but doesn't move the mark.
+            local started = os.time()
+            local options = {
+                since = self.highlights_parsed_at and (self.highlights_parsed_at - 5) or nil,
+                checkpoint = not only and started or nil,
+            }
+            local exported, parse_err, failures = step("highlights", function()
+                return self:exportHighlights(only, options)
+            end)
             report.highlights = exported or 0
             self.sync_highlights_ok = not parse_err and failures == 0
             if parse_err then
@@ -197,7 +242,11 @@ function SyncModes.install(R, deps)
         if has_pending_tags then
             self:runAutomated("highlight_tags", "Apply highlight tags in Readwise?", function()
                 report.tags = step("highlight tags", function()
-                    self:refreshReadwiseTagCache()
+                    -- The tag list is for the picker: once a day is enough.
+                    if os.time() - (self.tag_cache_refreshed_at or 0) > SyncModes.TAG_CACHE_SECONDS then
+                        self:refreshReadwiseTagCache()
+                        self.tag_cache_refreshed_at = os.time()
+                    end
                     return self:applyPendingHighlightTags()
                 end) or 0
             end)
@@ -218,8 +267,16 @@ function SyncModes.install(R, deps)
             end
         end
 
-        -- Readwise Books: status, rating and dates of books here.
-        local shelves, books_report = step("Readwise Books", function() return self:syncReadwiseBooks() end)
+        -- Readwise Books: status, rating and dates of books here. Opening and
+        -- closing a book already sends its own changes, so a sync within a
+        -- few minutes of the last one skips the full library request.
+        local shelves, books_report
+        -- Sync books and Sync all always fetch it: their downloads need the shelves.
+        if kinds == "all" or kinds == "books"
+            or os.time() - (self.books_synced_at or 0) >= SyncModes.BOOKS_MIN_SECONDS then
+            shelves, books_report = step("Readwise Books", function() return self:syncReadwiseBooks() end)
+            if books_report then self.books_synced_at = os.time() end
+        end
         report.books_shelves, report.books_report = shelves, books_report
         if books_report then
             books_report.sessions = step("sessions", function() return self:syncSessions() end) or 0
@@ -346,11 +403,49 @@ function SyncModes.install(R, deps)
         end)
     end
 
-    -- After a book closes, once the file browser is back: the automatic sync,
-    -- only when already online (never turns Wi-Fi on). The reader's plugin
-    -- instance goes away with the book, so the file browser's instance runs it.
-    function R:scheduleAutoSync()
-        local mode = self.auto_sync_mode
+    -- ------------------------------------------------------------------
+    -- Automatic: closing a book, every few pages
+    -- ------------------------------------------------------------------
+
+    -- One closed book, a few requests and no library scan. Its position,
+    -- Readwise Books status and session, and Device Sync's record were
+    -- already sent when it closed; this adds its highlights and notes, tags,
+    -- its book note, and passes new Reader ids on to the other readers.
+    function R:quickBookSync(filepath)
+        local doc_id = self:getReaderIdentity(filepath)
+        local lines = {}
+        self.reader_ids_stamped = 0
+        if self:automationMode("send_highlights") == "auto" then
+            local exported = step("highlights (one book)", function()
+                return self:exportHighlights(nil, { files = { [filepath] = true } })
+            end)
+            if exported and exported > 0 then table.insert(lines, string.format("Highlights sent: %d", exported)) end
+        end
+        if self:automationMode("highlight_tags") == "auto" then
+            local tags = step("highlight tags", function() return self:applyPendingHighlightTags() end)
+            if tags and tags > 0 then table.insert(lines, string.format("Highlight tags applied: %d", tags)) end
+        end
+        if doc_id and self.syncBookNotes then
+            local notes = step("book note", function() return self:syncBookNotes(nil, doc_id) end)
+            if notes and notes.sent + notes.received > 0 then table.insert(lines, "Book note synced") end
+        end
+        if (self.reader_ids_stamped or 0) > 0 then
+            local device_sync = self.ui and self.ui.device_sync
+            if device_sync and device_sync.syncPathQuietly then
+                step("Device Sync (one book)", function() return device_sync:syncPathQuietly(filepath) end)
+            end
+        end
+        self:hideProgress()
+        if #lines > 0 then
+            UIManager:show(InfoMessage:new{ text = table.concat(lines, "\n"), timeout = 2 })
+        end
+    end
+
+    -- After a book closes, once the file browser is back, only when already
+    -- online (never turns Wi-Fi on). The reader's plugin instance goes away
+    -- with the book, so the file browser's instance runs it.
+    function R:scheduleAutoSync(filepath)
+        local mode = self.close_sync_mode
         if mode == "off" or not self:hasAccessToken() then return end
         UIManager:scheduleIn(4, function()
             local ReaderUI = require("apps/reader/readerui")
@@ -358,35 +453,71 @@ function SyncModes.install(R, deps)
             local plugin = FileManager.instance and FileManager.instance.readwisereader
             if not plugin or plugin.sync_running then return end
             Trapper:wrap(function()
-                plugin:synchronize(mode == "reading" and "reading" or "all", true)
+                if mode == "book" then
+                    if not filepath then return end
+                    plugin.sync_running = true
+                    local ok, err = pcall(plugin.quickBookSync, plugin, filepath)
+                    plugin.sync_running = false
+                    if not ok then logger.warn("ReadwiseReader: quick sync failed", err) end
+                else
+                    plugin:synchronize(mode == "reading" and "reading" or "all", true)
+                end
             end)
         end)
     end
 
-    function R:getAutoSyncMenuItem()
+    -- Every PAGE_SYNC_EVERY page turns (and at most once a minute), the open
+    -- document's position goes to Reader. Only when already online, never
+    -- with a question.
+    function R:onPageUpdate()
+        if not self.page_sync or not self.sync_reading_progress then return end
+        self.pages_since_sync = (self.pages_since_sync or 0) + 1
+        if self.pages_since_sync < SyncModes.PAGE_SYNC_EVERY then return end
+        if os.time() - (self.page_synced_at or 0) < SyncModes.PAGE_SYNC_MIN_SECONDS then return end
+        if not NetworkMgr:isOnline() then return end
+        self.pages_since_sync, self.page_synced_at = 0, os.time()
+        UIManager:nextTick(function()
+            local ok, err = pcall(self.pushOpenDocumentProgress, self, "pages")
+            if not ok then logger.warn("ReadwiseReader: page position push failed", err) end
+        end)
+    end
+
+    function R:getAutoSyncMenuItem(separator)
         local modes = {}
         for _, pair in ipairs(SyncModes.AUTO_MODES) do
             local mode, label = pair[1], pair[2]
             table.insert(modes, {
                 text = label,
                 radio = true,
-                checked_func = function() return self.auto_sync_mode == mode end,
+                checked_func = function() return self.close_sync_mode == mode end,
                 callback = function()
-                    self.auto_sync_mode = mode
+                    self.close_sync_mode = mode
                     self:saveSettings()
                 end,
             })
         end
+        modes[#modes].separator = true
+        table.insert(modes, {
+            text = string.format("Send position every %d pages", SyncModes.PAGE_SYNC_EVERY),
+            help_text = "While reading, sends your position to Readwise Reader every few pages (at most "
+                .. "once a minute), only when Wi-Fi is already on. Opening, closing and sleep always send it.",
+            checked_func = function() return self.page_sync end,
+            callback = function()
+                self.page_sync = not self.page_sync
+                self:saveSettings()
+            end,
+        })
         return {
             text_func = function()
                 for _, pair in ipairs(SyncModes.AUTO_MODES) do
-                    if pair[1] == self.auto_sync_mode then return "Sync after closing a book: " .. pair[2] end
+                    if pair[1] == self.close_sync_mode then return "Automatic sync: " .. pair[2] end
                 end
-                return "Sync after closing a book"
+                return "Automatic sync"
             end,
-            help_text = "Runs a few seconds after you close a book, only when Wi-Fi is already on. "
-                .. "A summary shows only when something changed.",
+            help_text = "What syncs on its own a few seconds after you close a book (only when Wi-Fi is "
+                .. "already on), and the position while you read.",
             sub_item_table = modes,
+            separator = separator,
         }
     end
 end

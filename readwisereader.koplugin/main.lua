@@ -1109,7 +1109,38 @@ function ReadwiseReader:runSyncAction(action)
     end)
 end
 
-function ReadwiseReader:parseAllBooks()
+-- When a document's sidecar last changed (epoch), or nil when unknown.
+function ReadwiseReader:sidecarModified(filepath)
+    local ok, sidecar = pcall(function()
+        if DocSettings.findSidecarFile then
+            return (DocSettings:findSidecarFile(filepath))
+        end
+        return DocSettings:getSidecarFile(filepath)
+    end)
+    if not ok or type(sidecar) ~= "string" then return nil end
+    return lfs.attributes(sidecar, "modification")
+end
+
+-- History documents whose sidecar changed at or after `since` (epoch), as a
+-- set; unknown modification times count as changed.
+function ReadwiseReader:historyFilesChangedSince(since)
+    local files = {}
+    for _, item in ipairs(require("readhistory").hist or {}) do
+        if item.file and not item.dim then
+            local modified = self:sidecarModified(item.file)
+            if modified == nil or modified >= since then
+                files[item.file] = true
+            end
+        end
+    end
+    return files
+end
+
+-- options.files: only these documents (set of paths). options.since: only
+-- documents whose sidecar changed since then (epoch). Neither: every book
+-- in the history. Kindle's own My Clippings is read only when it changed.
+function ReadwiseReader:parseAllBooks(options)
+    options = options or {}
     local clippings = {}
 
     -- parseHistory reads annotations from the .sdr files on disk, so we need to flush
@@ -1122,13 +1153,22 @@ function ReadwiseReader:parseAllBooks()
     end
 
     -- Parse from history
-    local history_clippings = self.parser:parseHistory()
+    local history_clippings
+    if (options.files or options.since) and self.parser.parseFiles then
+        local files = options.files or self:historyFilesChangedSince(options.since)
+        history_clippings = next(files) and self.parser:parseFiles(files) or {}
+    else
+        history_clippings = self.parser:parseHistory()
+    end
     for title, booknotes in pairs(history_clippings) do
         clippings[title] = booknotes
     end
-    
-    -- Parse from Kindle My Clippings if available
-    if Device:isKindle() then
+
+    -- Parse from Kindle My Clippings if available and changed
+    local my_clippings = "/mnt/us/documents/My Clippings.txt"
+    local my_clippings_modified = Device:isKindle() and lfs.attributes(my_clippings, "modification") or nil
+    if my_clippings_modified and not options.files
+        and (not options.since or my_clippings_modified >= options.since) then
         local kindle_clippings = self.parser:parseMyClippings()
         for title, booknotes in pairs(kindle_clippings) do
             if clippings[title] == nil or #clippings[title] < #booknotes then
@@ -1266,10 +1306,14 @@ function ReadwiseReader:prepareHighlightLedger(entries)
     return true
 end
 
-function ReadwiseReader:exportHighlights(only_ids)
+-- options: passed to parseAllBooks (files / since). With options.checkpoint
+-- (epoch), a fully successful export records it as highlights_parsed_at, so
+-- the next one reads only documents changed since.
+function ReadwiseReader:exportHighlights(only_ids, options)
+    options = options or {}
     self:showProgress("Exporting highlights to Readwise...")
 
-    local success, clippings = pcall(function() return self:parseAllBooks() end)
+    local success, clippings = pcall(function() return self:parseAllBooks(options) end)
     if not success then
         self:hideProgress()
         logger.warn("ReadwiseReader:exportHighlights: error parsing books for highlights:", clippings)
@@ -1287,6 +1331,10 @@ function ReadwiseReader:exportHighlights(only_ids)
 
     if next(clippings) == nil then
         self:hideProgress()
+        if options.checkpoint and not only_ids then
+            self.highlights_parsed_at = options.checkpoint
+            self:saveSettings()
+        end
         return 0, nil, 0
     end
 
@@ -1428,6 +1476,10 @@ function ReadwiseReader:exportHighlights(only_ids)
     end
 
     self:hideProgress()
+    if options.checkpoint and not only_ids and #report.failures == 0 then
+        self.highlights_parsed_at = options.checkpoint
+        self:saveSettings()
+    end
     return report.confirmed + placement.placed + placement.updated, nil, #report.failures
 end
 
@@ -1449,33 +1501,59 @@ function ReadwiseReader:getVersion()
     return ok and type(meta) == "table" and meta.version or "unknown"
 end
 
+-- A Font Awesome symbol from the icon font KOReader ships (the same glyphs
+-- Writer Deck uses), as UTF-8, followed by two spaces.
+local function menuIcon(codepoint)
+    return string.char(
+        0xE0 + math.floor(codepoint / 4096),
+        0x80 + math.floor(codepoint / 64) % 64,
+        0x80 + codepoint % 64) .. "  "
+end
+
 function ReadwiseReader:addToMainMenu(menu_items)
     menu_items.readwisereader = {
         text = "Readwise Reader",
         sub_item_table = {
             {
-                text = "Search Library",
+                text = menuIcon(0xF021) .. "Sync reading data",
+                help_text = "Only documents already on this device, books first: reading positions, "
+                    .. "highlights and notes (to Readwise and to your other readers), highlight tags, "
+                    .. "book notes, and Readwise Books status and rating. Nothing is downloaded or deleted.",
+                callback = function()
+                    self:startSync("reading")
+                end,
+            },
+            {
+                text = menuIcon(0xF02D) .. "Sync books",
+                help_text = "Reading data for books, then books from your chosen Readwise Books shelves, "
+                    .. "uploads, and finished books.",
+                callback = function()
+                    self:startSync("books")
+                end,
+            },
+            {
+                text = menuIcon(0xF0C2) .. "Sync all",
+                help_text = "Reading data, then books, then articles: everything Readwise Reader syncs.",
+                callback = function()
+                    self.ui:handleEvent(Event:new("SynchronizeReadwiseReader"))
+                end,
+            },
+            self:getAutoSyncMenuItem(true),
+            {
+                text = menuIcon(0xF002) .. "Search Library",
                 keep_menu_open = true,
                 callback = function(touchmenu_instance)
                     self.browser:showSearchDialog(touchmenu_instance)
                 end,
             },
             {
-                text = "Browse Reader",
+                text = menuIcon(0xF07C) .. "Browse Reader",
                 sub_item_table_func = function()
                     return self.browser:getLocationItems()
                 end,
             },
             {
-                text = "Views",
-                help_text = "Quick Reads, Long Reads, and In Progress scan your Inbox, Later, Shortlist, "
-                    .. "and Archive metadata so you can pick what to download. Nothing downloads automatically.",
-                sub_item_table_func = function()
-                    return self.browser:getViewsMenuItems()
-                end,
-            },
-            {
-                text = "Readwise Books shelves",
+                text = menuIcon(0xF02E) .. "Readwise Books shelves",
                 help_text = "Your Readwise Books shelves, showing the books that are in Reader. "
                     .. "Pick books to download them, whatever the automatic download setting.",
                 sub_item_table_func = function()
@@ -1483,13 +1561,22 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = "Highlights",
+                text = menuIcon(0xF0B0) .. "Views",
+                help_text = "Quick Reads, Long Reads, and In Progress scan your Inbox, Later, Shortlist, "
+                    .. "and Archive metadata so you can pick what to download. Nothing downloads automatically.",
+                sub_item_table_func = function()
+                    return self.browser:getViewsMenuItems()
+                end,
+            },
+            {
+                text = menuIcon(0xF10D) .. "Highlights",
                 help_text = "Read-only access to your Readwise highlights, grouped by Books/Articles/"
                     .. "Tweets/Podcasts. Search stays local to this device; Daily Review shows today's "
                     .. "review as sent by Readwise.",
                 sub_item_table_func = function()
                     return self.highlights_browser:getMenuItems()
                 end,
+                separator = true,
             },
             {
                 text = "Readwise Books",
@@ -1630,31 +1717,6 @@ function ReadwiseReader:addToMainMenu(menu_items)
                     },
                 },
             },
-            {
-                text = "Sync reading data",
-                help_text = "Only documents already on this device, books first: reading positions, "
-                    .. "highlights and notes (to Readwise and to your other readers), highlight tags, "
-                    .. "book notes, and Readwise Books status and rating. Nothing is downloaded or deleted.",
-                callback = function()
-                    self:startSync("reading")
-                end,
-            },
-            {
-                text = "Sync books",
-                help_text = "Reading data for books, then books from your chosen Readwise Books shelves, "
-                    .. "uploads, and finished books.",
-                callback = function()
-                    self:startSync("books")
-                end,
-            },
-            {
-                text = "Sync all",
-                help_text = "Reading data, then books, then articles: everything Readwise Reader syncs.",
-                callback = function()
-                    self.ui:handleEvent(Event:new("SynchronizeReadwiseReader"))
-                end,
-            },
-            self:getAutoSyncMenuItem(),
             {
                 text = "Go to download folder",
                 callback = function()
@@ -3502,7 +3564,7 @@ function ReadwiseReader:highlightsSafeToRemove(filepath)
     if not doc_id then
         return true
     end
-    local _count, err, failures = self:exportHighlights({ [doc_id] = true })
+    local _count, err, failures = self:exportHighlights({ [doc_id] = true }, { files = { [filepath] = true } })
     if err or (failures or 0) > 0 then
         logger.warn("ReadwiseReader:highlightsSafeToRemove: keeping", filepath, "- highlight export failed", err)
         self.removals_held = (self.removals_held or 0) + 1
@@ -4950,8 +5012,9 @@ function ReadwiseReader:pushOpenDocumentProgress(trigger)
         return
     end
     local decision = self:actionDecision("push_progress")
-    -- No dialog while the device is going to sleep: Ask means "not now" there.
-    if decision == "skip" or (decision == "ask" and trigger == "suspend") then
+    -- No dialog while the device is going to sleep or while reading: Ask
+    -- means "not now" there.
+    if decision == "skip" or (decision == "ask" and (trigger == "suspend" or trigger == "pages")) then
         return
     end
     local percent, finished = self:getCurrentLocalProgress(filepath)
@@ -4990,7 +5053,7 @@ function ReadwiseReader:onCloseDocument()
             logger.warn("ReadwiseReader:onCloseDocument: Readwise Books update failed", err)
         end
     end
-    self:scheduleAutoSync()
+    self:scheduleAutoSync(filepath)
 end
 
 function ReadwiseReader:onSuspend()
@@ -5238,7 +5301,7 @@ function ReadwiseReader:runSynchronize()
 
     -- Reading data first (positions, highlights, notes, Readwise Books),
     -- then what Sync books and the articles add: downloads and removals.
-    local reading = self:syncReadingData()
+    local reading = self:syncReadingData("all")
     local highlights_exported = reading.highlights or 0
     local tags_applied = reading.tags or 0
     local books_shelves, books_report = reading.books_shelves, reading.books_report

@@ -23,6 +23,11 @@ v2.6 (via [Endle/readwisereader](https://github.com/Endle/readwisereader)). Vers
   download (they were held back until already on the device).
 
 ### Changed
+- Closing a book syncs only that book (highlights, notes, tags, book note) instead of everything,
+  and the position is sent every 10 pages while reading. **Automatic sync** chooses.
+- Sync reading data reads highlights only from books changed since the last sync, checks
+  positions without the Feed, refreshes the tag list once a day, and logs how long each step takes.
+- The three syncs and the browsing entries come first in the menu, with icons.
 - New downloads are named `Title [rw-<id>].ext` instead of `[rw-id_<id>] Title.ext`. Existing files
   keep their names.
 - **Books download as the original EPUB.** Documents Reader files under EPUB (books you uploaded)

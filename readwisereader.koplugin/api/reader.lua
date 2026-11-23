@@ -289,10 +289,13 @@ end
 -- every location. Moving the reading position bumps updated_at, so this is
 -- the cheap way to learn which positions moved elsewhere. Returns a list or
 -- nil, err, status.
-function Reader:listUpdatedSince(since, max_pages)
+function Reader:listUpdatedSince(since, max_pages, location)
     local documents, cursor = {}, nil
     for _ = 1, max_pages or 20 do
         local endpoint = "/list/?withHtmlContent=false&limit=100&updatedAfter=" .. queryEscape(since)
+        if location then
+            endpoint = endpoint .. "&location=" .. queryEscape(location)
+        end
         if cursor then
             endpoint = endpoint .. "&pageCursor=" .. queryEscape(cursor)
         end

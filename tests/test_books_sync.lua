@@ -91,6 +91,7 @@ local function newPlugin(books, local_books)
     local self = setmetatable({}, { __index = ReadwiseReader })
     self:initBooks({ books_sync_enabled = true })
     self:initFinishOptions({})
+    self:initSyncModes({})
     self.books_api = newBooksApi(books)
     self.reader_api = { listEpubIdentities = function() return {} end }
     self.document_categories = {}
@@ -346,6 +347,62 @@ check("books only: highlights limited, no second device pass", table.concat(orde
 local SyncModes = require("sync_modes")
 check("booksFirst keeps order", table.concat(SyncModes.booksFirst({ "a1", "b1", "a2", "b2" },
     function(x) return x:sub(1, 1) == "b" end), ","), "b1,b2,a1,a2")
+
+print("\n== every 10 pages, at most once a minute ==")
+local pg = newPlugin(BOOKS, {})
+pg.sync_reading_progress = true
+for _ = 1, 9 do pg:onPageUpdate() end
+check("not before 10 pages", pg.page_synced_at, nil)
+pg:onPageUpdate()
+check("sent at 10 pages", pg.page_synced_at ~= nil and pg.pages_since_sync, 0)
+for _ = 1, 10 do pg:onPageUpdate() end
+check("not twice in a minute", pg.pages_since_sync, 10)
+pg.page_sync = false
+pg.pages_since_sync, pg.page_synced_at = 0, nil
+for _ = 1, 20 do pg:onPageUpdate() end
+check("off: nothing", pg.page_synced_at, nil)
+
+print("\n== quick sync of one closed book ==")
+local qb = newPlugin(BOOKS, {})
+qb.getReaderIdentity = function(_, path) return path:match("%[rw%-(%w+)%]") end
+local calls = {}
+qb.automationMode = function() return "auto" end
+qb.exportHighlights = function(self_, only, options)
+    table.insert(calls, "highlights:" .. tostring(only) .. ":" .. tostring(next(options.files)))
+    self_.reader_ids_stamped = 1
+    return 2, nil, 0
+end
+qb.applyPendingHighlightTags = function() table.insert(calls, "tags"); return 0 end
+qb.syncBookNotes = function(_, kinds, doc) table.insert(calls, "note:" .. tostring(doc)); return { sent = 0, received = 0, conflicts = 0 } end
+qb.ui = { device_sync = { syncPathQuietly = function(_, path) table.insert(calls, "device:" .. path) end } }
+qb:quickBookSync("/b/Thick Face [rw-bk9].epub")
+check("one book only, ids passed on", table.concat(calls, ","),
+    "highlights:nil:/b/Thick Face [rw-bk9].epub,tags,note:bk9,device:/b/Thick Face [rw-bk9].epub")
+calls = {}
+qb.automationMode = function() return "ask" end
+qb:quickBookSync("/b/Other [rw-bk8].epub")
+check("Ask or Manual: no questions after closing", table.concat(calls, ","), "note:bk8")
+
+print("\n== highlights read only what changed ==")
+local hp = newPlugin(BOOKS, {})
+local seen_options
+hp.flushPendingLinkSaves, hp.flushPendingTagUpdates, hp.flushPendingNoteUpdates = function() end, function() end, function() end
+hp.cleanupProgressNotes = function() end
+hp.syncLocalPositions = function() return { seeded = 0, pushed = 0 } end
+hp.automationMode = function() return "auto" end
+hp.runAutomated = function(_, _, _, fn) fn() end
+hp.exportHighlights = function(_, only, options) seen_options = { only = only, options = options }; return 0, nil, 0 end
+hp.highlight_tags = {}
+hp.syncBookNotes = nil
+hp.syncReadwiseBooks = function() return {}, nil end
+hp:syncReadingData()
+check("first time: everything", seen_options.options.since, nil)
+check("first time: sets the mark", seen_options.options.checkpoint ~= nil, true)
+hp.highlights_parsed_at = 1000
+hp:syncReadingData()
+check("then only changed sidecars", seen_options.options.since, 995)
+hp:syncReadingData("books")
+check("books only: mark not moved", seen_options.options.checkpoint, nil)
 
 print(failures == 0 and "\nall passed" or string.format("\n%d failure(s)", failures))
 os.exit(failures == 0 and 0 or 1)
