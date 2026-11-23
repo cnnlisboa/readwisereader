@@ -196,5 +196,32 @@ q:booksOnOpen("/b/six.epub")
 check("re-read moves back to reading", q.books_api.patches[2].status, "currently_reading")
 check("open book marked reading", sidecars["/b/six.epub"].summary.status, "reading")
 
+print("== new Reader books get their shelf before download ==")
+local NEW_BOOKS = {
+    { id = 11, title = "Reading Now", author = "Ann Writer", status = "currently_reading" },
+    { id = 12, title = "Someday", author = "Bob Writer", status = "want_to_read" },
+}
+local n = newPlugin(NEW_BOOKS, {})
+local list_calls = 0
+n.reader_api = { listEpubIdentities = function()
+    list_calls = list_calls + 1
+    return {
+        { id = "new1", title = "Reading Now", author = "Ann Writer" },
+        { id = "new2", title = "Someday", author = "Bob Writer" },
+        { id = "new3", title = "Not in Books", author = "Nobody" },
+    }
+end }
+local new_shelves = n:syncReadwiseBooks()
+check("nothing local: no Reader list during the Books step", list_calls, 0)
+n:addCandidateShelves(new_shelves, { "new1", "new2", "new3" })
+check("new book matched", new_shelves.new1, "currently_reading")
+check("other shelf matched", new_shelves.new2, "want_to_read")
+check("unknown book has no shelf", new_shelves.new3, nil)
+check("one Reader list", list_calls, 1)
+new_shelves = n:syncReadwiseBooks()
+n:addCandidateShelves(new_shelves, { "new3" })
+check("known-unmatched book: no new list", list_calls, 1)
+check("mapped book shelf comes from the Books step", new_shelves.new1, "currently_reading")
+
 print(failures == 0 and "\nall passed" or string.format("\n%d failure(s)", failures))
 os.exit(failures == 0 and 0 or 1)

@@ -495,9 +495,37 @@ function BooksSync.install(R, deps)
             end
         end
         report.queued = #self.pending_books_updates
+        self.books_last_list = { books = books, by_id = by_id }
         self:saveSettings()
         self:hideProgress()
         return shelves, report
+    end
+
+    -- The shelf of each Reader book about to be downloaded. Matching above
+    -- only covers books already on the device, so a new book is matched here
+    -- (one Reader list request, skipped when every candidate was already
+    -- unmatched against an unchanged Books library).
+    function R:addCandidateShelves(shelves, doc_ids)
+        local last = self.books_last_list
+        if not (shelves and last) then return shelves end
+        local signature = tostring(#last.books)
+        local needed = false
+        for _, doc_id in ipairs(doc_ids) do
+            if not shelves[doc_id] and not (self.books_ids[doc_id] and last.by_id[self.books_ids[doc_id]])
+                and (not self.books_unmatched[doc_id] or signature ~= self.books_match_signature) then
+                needed = true
+                break
+            end
+        end
+        if needed then
+            self:refreshBooksIdentities(last.books, last.by_id, true)
+            self:saveSettings()
+        end
+        for _, doc_id in ipairs(doc_ids) do
+            local book = last.by_id[self.books_ids[doc_id] or -1]
+            if book and not shelves[doc_id] then shelves[doc_id] = book.status end
+        end
+        return shelves
     end
 
     -- ------------------------------------------------------------------

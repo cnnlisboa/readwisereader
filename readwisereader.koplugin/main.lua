@@ -5236,6 +5236,18 @@ function ReadwiseReader:runSynchronize()
     local held_by_shelf, held_by_mode = 0, 0
     do
         local others, books_to_get = {}, {}
+        if books_shelves then
+            local candidates = {}
+            for _, document in ipairs(filtered_documents) do
+                if document.category == "epub" and not replace_paths[document.id] then
+                    table.insert(candidates, document.id)
+                end
+            end
+            if #candidates > 0 then
+                local ok, result = pcall(function() return self:addCandidateShelves(books_shelves, candidates) end)
+                if not ok then logger.warn("ReadwiseReader:synchronize: matching new books failed", result) end
+            end
+        end
         for _, document in ipairs(filtered_documents) do
             if document.category == "epub" and not replace_paths[document.id] then
                 local shelf = books_shelves and books_shelves[document.id]
