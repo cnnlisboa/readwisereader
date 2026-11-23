@@ -442,6 +442,43 @@ function Reader:getDocument(document_id, with_html_content, with_raw_source)
     return nil, "not_found"
 end
 
+-- Every EPUB in Reader, every location, with just what Readwise Books
+-- matching needs (library/books_map.lua). Returns list or nil, err, status.
+function Reader:listEpubIdentities()
+    local identities, cursor = {}, nil
+    for _ = 1, 100 do
+        local endpoint = "/list/?category=epub&withHtmlContent=false&limit=100"
+        if cursor then
+            endpoint = endpoint .. "&pageCursor=" .. queryEscape(cursor)
+        end
+        local response, err, status = self.request("GET", endpoint)
+        if not response then
+            return nil, err or "request_failed", status
+        end
+        if type(response.results) ~= "table" then
+            return nil, "malformed_response"
+        end
+        for _, document in ipairs(response.results) do
+            if type(document) == "table" and stringOrNil(document.id) and not document.parent_id then
+                table.insert(identities, {
+                    id = document.id,
+                    title = stringOrNil(document.title),
+                    author = stringOrNil(document.author),
+                    saved_at = stringOrNil(document.saved_at),
+                    location = stringOrNil(document.location),
+                    reading_progress = type(document.reading_progress) == "number" and document.reading_progress or nil,
+                })
+            end
+        end
+        cursor = response.nextPageCursor
+        if type(cursor) ~= "string" and type(cursor) ~= "number" then
+            break
+        end
+        cursor = tostring(cursor)
+    end
+    return identities
+end
+
 -- A fresh presigned link to the document's original file. Asked for right
 -- before each download because the link expires after an hour. Returns the
 -- URL, or nil and "no_raw_source" when Reader has none to give (a document it

@@ -69,6 +69,10 @@ end
 -- case of two highlights made inside the same second. Shared with
 -- api/reader_highlights.lua, which keys its placed-highlight records on it.
 function Highlights.annotationKey(clipping)
+    -- Chapter headings made by this plugin have no annotation of their own.
+    if type(clipping.heading_key) == "string" then
+        return clipping.heading_key
+    end
     local parts = {}
     if type(clipping.time) == "number" and clipping.time > 0 then
         table.insert(parts, tostring(clipping.time))
@@ -147,8 +151,11 @@ end
 -- book-level success. An optional context.include(clipping) leaves out
 -- highlights another path owns (those placed in Reader through v3) while still
 -- counting them, so the order fallback of the rest does not shift.
+-- context.meta(clipping), when given, returns bookkeeping that travels with
+-- the payload (not sent) and comes back in the report for each highlight
+-- Readwise accepted.
 function Highlights.buildBook(booknotes, context)
-    local payloads, skipped, order = {}, {}, 0
+    local payloads, skipped, order, metas = {}, {}, 0, {}
     for _, chapter in ipairs(booknotes) do
         for _, clipping in ipairs(chapter) do
             order = order + 1
@@ -156,13 +163,14 @@ function Highlights.buildBook(booknotes, context)
                 local highlight, err = Highlights.buildHighlight(clipping, context, order)
                 if highlight then
                     table.insert(payloads, highlight)
+                    metas[#payloads] = context.meta and context.meta(clipping) or nil
                 else
                     table.insert(skipped, string.format("highlight %d: %s", order, err))
                 end
             end
         end
     end
-    return payloads, skipped
+    return payloads, skipped, metas
 end
 
 function Highlights.countModified(response)
@@ -194,23 +202,24 @@ function Highlights:sendBatch(entries)
 
     local response, err = self:postBatch(payloads)
     if response then
-        return Highlights.countModified(response), {}
+        return Highlights.countModified(response), {}, entries
     end
 
     if #entries == 1 then
-        return 0, { { book = entries[1].book, message = tostring(err) } }
+        return 0, { { book = entries[1].book, message = tostring(err) } }, {}
     end
 
-    local confirmed, failures = 0, {}
+    local confirmed, failures, accepted = 0, {}, {}
     for _, entry in ipairs(entries) do
         local single, single_err = self:postBatch({ entry.payload })
         if single then
             confirmed = confirmed + Highlights.countModified(single)
+            table.insert(accepted, entry)
         else
             table.insert(failures, { book = entry.book, message = tostring(single_err) })
         end
     end
-    return confirmed, failures
+    return confirmed, failures, accepted
 end
 
 -- `books` is an array of { context = <context>, booknotes = <parsed book> }.
@@ -222,30 +231,33 @@ end
 --   skipped   -- highlights rejected locally, with the reason
 --   failures  -- highlights the server rejected, with the reason
 function Highlights:export(books)
-    local report = { sent = 0, confirmed = 0, skipped = {}, failures = {} }
+    local report = { sent = 0, confirmed = 0, skipped = {}, failures = {}, accepted = {} }
     local queue = {}
 
     local function flush()
         if #queue == 0 then
             return
         end
-        local confirmed, failures = self:sendBatch(queue)
+        local confirmed, failures, accepted = self:sendBatch(queue)
         report.confirmed = report.confirmed + confirmed
         for _, failure in ipairs(failures) do
             table.insert(report.failures, failure)
+        end
+        for _, entry in ipairs(accepted or {}) do
+            if entry.meta then table.insert(report.accepted, entry.meta) end
         end
         queue = {}
     end
 
     for _, book in ipairs(books) do
         local title = book.context.title or "Untitled"
-        local payloads, skipped = Highlights.buildBook(book.booknotes, book.context)
+        local payloads, skipped, metas = Highlights.buildBook(book.booknotes, book.context)
         for _, message in ipairs(skipped) do
             table.insert(report.skipped, { book = title, message = message })
         end
-        for _, payload in ipairs(payloads) do
+        for i, payload in ipairs(payloads) do
             report.sent = report.sent + 1
-            table.insert(queue, { payload = payload, book = title })
+            table.insert(queue, { payload = payload, book = title, meta = metas[i] })
             if #queue >= BATCH_SIZE then
                 flush()
             end

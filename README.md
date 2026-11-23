@@ -88,6 +88,34 @@ For a linked, open local book, choose **Readwise Reader → Linked book progress
 
 With **Sync reading position with Readwise Reader** on, this happens automatically.
 
+## Readwise Books
+
+**Readwise Reader → Readwise Books → Sync with Readwise Books** connects the books you read here to [Readwise Books](https://readwise.io/books_api). It works for EPUBs downloaded from Reader and for sideloaded books linked to Reader. The plugin matches them to Readwise Books entries by title and author.
+
+- **Opening a book** marks it *Currently reading* and sets its start date, if it has none.
+- **Finishing it**, putting it **On hold**, or **rating** it sends *Finished* (with the finish date), *Did not finish*, or the rating. A date or rating already in Readwise Books is never overwritten.
+- **Readwise Books changes reach this device at sync.** A book set to *Finished* is marked finished here. *Did not finish* puts it on hold. With **Add Want to read books to To Be Read** on, *Want to read* adds it to the *To Be Read* collection.
+- **Finished is final.** Opening a finished book asks whether to start a re-read. Only a re-read moves it back to *Currently reading*.
+- **Download books on these shelves** chooses which Reader books are downloaded at sync. The default is *Currently reading* only, so a book uploaded for later stays off the device. Books already here are kept.
+- **Delete finished books automatically** applies to books only; articles are not affected. Turn it off to keep every book on the device. Or use **Keep current book on device** for single books.
+- **Reading sessions** come from KOReader's reading statistics and are posted to Readwise Books. If several devices share statistics, use **Post reading sessions from this device** on only one of them.
+- **Sideloaded EPUBs** added to the book folder are offered for upload to Readwise. Books already in the folder when this is first switched on are not offered. Use **Upload current book to Readwise** for those, or **Never upload this book** to stop being asked.
+- **Readwise tags…** in the highlight menu tags a highlight. The tags are applied in Readwise at the next sync.
+
+The first sync after switching this on only records where each book stands. It doesn't act on old shelves, so books already *Finished* in Readwise aren't deleted all at once.
+
+## Automation
+
+Under **Readwise Reader → Automation**, each automatic action has its own mode:
+
+- **Automatic**: the action runs on its own.
+- **Ask**: you're asked each time.
+- **Manual**: the action only runs from **Automation → Run now**.
+
+Use Ask or Manual for anything that slows down opening a book. This covers reading position on open and on close, Readwise Books updates, downloading books, sending highlights, highlight tags, chapter headings, reading sessions, archiving finished documents, and EPUB uploads. The old "Archive finished articles" and "Export highlights at each sync" switches became the *Archive* and *Send highlights* modes, and your previous choice is kept.
+
+Highlights are sent once. They are sent again only if you edit them on the device, and never after they were deleted in Readwise. On first use the plugin reads your Readwise export to learn what is already there. For books not linked to Reader, a heading highlight (`.h2`) is added for each chapter that has highlights.
+
 ## Installation:
 - Download `readwisereader-vX.Y.Z.zip` from the [latest release](https://github.com/cnnlisboa/readwisereader/releases/latest). Extract it.
 - Attach your ereader to your computer. Copy the `readwisereader.koplugin` folder containing _meta.lua and main.lua from the extracted folder to the `koreader/plugins` folder. If you had the upstream plugin installed, replace its folder; your settings are kept. Restart KOReader.

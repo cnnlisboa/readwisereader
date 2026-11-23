@@ -530,6 +530,30 @@ was redesigned around how Readwise's own highlights view is organized:
   degrades the feature rather than crashing the menu. Confirm the real
   behavior on device before treating this as verified.
 
+## Readwise Books sync
+
+Implements `PLAN-readwise-books.md` (in the parent Repositories folder) on the KOReader side.
+
+| File | Role |
+|---|---|
+| `api/books.lua` | Readwise Books client. It validates items before sending, since unknown fields are silently ignored. It batches requests (PATCH 100, POST 10) and reads the result of every item, since a batch answers 200 even when items fail. |
+| `library/books_map.lua` | Pure decisions: matching Reader EPUBs to Books entries (title keys, author tokens, upload time, progress), KOReader status ↔ shelf, and what to do on open, on a device change, and on a Readwise change. |
+| `library/automation.lua` | Automatic / Ask / Manual per action, and migration from the old boolean settings. |
+| `library/sessions.lua` | Turns `statistics.sqlite3` page rows into sessions: a gap of more than 5 minutes ends a session; sessions under 2 minutes are dropped. It also keeps the record of sessions already sent. |
+| `library/highlight_ledger.lua` | Per-highlight record of what was sent, deleted remotely, or processed. Also builds automatic chapter headings. |
+| `library/epub_upload.lua` | PUT of a local EPUB to the upload URL from Readwise Books. |
+| `books_sync.lua` | Installed onto `ReadwiseReader`: settings, open/close hooks, the sync step, sessions, uploads and menus. |
+| `highlight_tags.lua` | "Readwise tags…" in the highlight menu, and applying the tags at sync (Reader v3 for highlights placed in Reader, v2 tags otherwise). |
+
+Rules worth knowing before changing this:
+
+- **Obsidian is the source of truth.** The device only fills empty values in Readwise Books (dates, rating) and moves the shelf. `finished` is sticky except through the re-read question.
+- **A Readwise change is applied only when it differs from the shelf this device last saw** (`books_state[id].remote_status`). The first sync records a baseline instead of acting, so a book finished months ago is not deleted when the feature is switched on.
+- **Status and rating are pushed before finished documents are archived and deleted**, because the sidecar holding them goes with the file.
+- **Kept books** (`books_keep`, or **Delete finished books automatically** off) are protected in all three removal paths: finishing, archive cleanup, and reconciliation against the Reader list.
+- **The shelf filter applies to new downloads only.** Applying it to the Reader list would make reconciliation delete books already on the device.
+- **Highlights are filtered through the ledger before v2 export.** A re-sent deleted highlight is recreated by Readwise (verified 2026-11-23), so a ledger that can't be checked against Readwise means nothing is sent that sync.
+
 ## Related
 
 - [Phase 1 implementation plan](PHASE-1.md)

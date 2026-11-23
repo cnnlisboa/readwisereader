@@ -10,11 +10,14 @@ never touch a real Readwise account.
 
 Run them from the repository root with the same runtime KOReader ships:
 
+    luajit tests/test_books.lua
+    luajit tests/test_books_sync.lua
     luajit tests/test_browser.lua
     luajit tests/test_downloadprogress.lua
     luajit tests/test_epub.lua
     luajit tests/test_epub_download.lua
     luajit tests/test_highlights.lua
+    luajit tests/test_highlight_ledger.lua
     luajit tests/test_highlights_read.lua
     luajit tests/test_local_links.lua
     luajit tests/test_progress.lua
