@@ -5521,7 +5521,8 @@ function ReadwiseReader:synchronize(mode, quiet)
     -- tap unless the work runs in a coroutine that can yield back to it.
     -- Trapper:wrap also keeps the device awake and logs any error with a
     -- stacktrace, which a bare coroutine would swallow.
-    if not coroutine.running() then
+    local co, is_main = coroutine.running()
+    if not co or is_main then
         Trapper:wrap(function() self:synchronize(mode, quiet) end)
         return
     end

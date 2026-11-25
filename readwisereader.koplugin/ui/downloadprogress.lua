@@ -123,6 +123,10 @@ Progress.__index = Progress
 -- so a caller can degrade to a plain message instead of failing a sync.
 function Progress.start(options)
     options = options or {}
+    -- nil on the main thread, also under LuaJIT built with Lua 5.2
+    -- compatibility, where coroutine.running() returns the main thread.
+    local co, is_main = coroutine.running()
+    if is_main then co = nil end
 
     local self = setmetatable({
         total = tonumber(options.total) or 0,
@@ -131,7 +135,7 @@ function Progress.start(options)
         cancelled = false,
         waiting = false,
         last_redraw = 0,
-        co = coroutine.running(),
+        co = co,
     }, Progress)
 
     local ok, dialog = pcall(function()
