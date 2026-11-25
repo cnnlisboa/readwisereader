@@ -224,11 +224,12 @@ function BooksMap.planLocalChange(book, now_local, state, now)
     if status_changed then
         local target = BooksMap.shelfForLocal(now_local.status, now_local.in_tbr)
         if target and target ~= book.status then
-            if book.status == "finished" then
-                -- sticky; a re-read goes through planOpen's prompt
-            elseif target == "want_to_read" and (SHELF_RANK[book.status] or 0) > SHELF_RANK.want_to_read then
-                -- To Be Read never pulls a started book back
-            else
+            -- Finished is sticky (a re-read goes through planOpen's prompt),
+            -- and To Be Read never pulls a started book back.
+            local sticky = book.status == "finished"
+            local pulls_back = target == "want_to_read"
+                and (SHELF_RANK[book.status] or 0) > SHELF_RANK.want_to_read
+            if not sticky and not pulls_back then
                 patch.status = target
             end
         end
