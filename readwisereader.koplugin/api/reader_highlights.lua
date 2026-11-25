@@ -63,24 +63,33 @@ end
 -- It is updated in place, so the caller only has to persist it.
 --
 -- Returns { placed, updated, unplaced, failures = { { book, message } } }.
-function ReaderHighlights:exportBook(document_id, title, booknotes, records, since)
+--
+-- hooks (optional), for crash safety (library/export_journal.lua):
+--   hooks.blocked[key]          don't place this one now (an earlier attempt
+--                               may have reached Reader; not yet confirmed)
+--   hooks.before(key, text, note) runs before a placement request
+--   hooks.after(key)              runs after any request, records updated
+function ReaderHighlights:exportBook(document_id, title, booknotes, records, since, hooks)
     local report = { placed = 0, updated = 0, unplaced = 0, failures = {} }
     for _, chapter in ipairs(booknotes) do
         for _, clipping in ipairs(chapter) do
             if ReaderHighlights.isEligible(clipping, since) then
-                self:exportOne(document_id, title, clipping, records, report)
+                self:exportOne(document_id, title, clipping, records, report, hooks)
             end
         end
     end
     return report
 end
 
-function ReaderHighlights:exportOne(document_id, title, clipping, records, report)
+function ReaderHighlights:exportOne(document_id, title, clipping, records, report, hooks)
+    hooks = hooks or {}
     local key = Highlights.annotationKey(clipping)
     local record = records[key]
     local note = stringOrNil(clipping.note) or ""
 
     if record == nil then
+        if hooks.blocked and hooks.blocked[key] then return end
+        if hooks.before then hooks.before(key, clipping.text, note) end
         local result, err, code = self.request("POST", "/save/", {
             parent_id = document_id,
             content = escapeHtml(clipping.text),
@@ -102,6 +111,7 @@ function ReaderHighlights:exportOne(document_id, title, clipping, records, repor
                 message = "could not place highlight in Reader (" .. tostring(code or err) .. ")",
             })
         end
+        if hooks.after then hooks.after(key) end
         return
     end
 
@@ -123,6 +133,25 @@ function ReaderHighlights:exportOne(document_id, title, clipping, records, repor
             message = "could not update highlight note in Reader (" .. tostring(code or err) .. ")",
         })
     end
+    if hooks.after then hooks.after(key) end
+end
+
+-- Reader highlight documents updated since `since` (ISO time), for checking
+-- whether an interrupted placement arrived. Returns the list, or nil, err.
+function ReaderHighlights:listSince(since, max_pages)
+    local results, cursor = {}, nil
+    for _ = 1, max_pages or 10 do
+        local endpoint = "/list/?category=highlight&updatedAfter=" .. since
+        if cursor then endpoint = endpoint .. "&pageCursor=" .. tostring(cursor) end
+        local response, err, code = self.request("GET", endpoint)
+        if type(response) ~= "table" or type(response.results) ~= "table" then
+            return nil, err or code or "invalid_response"
+        end
+        for _, doc in ipairs(response.results) do table.insert(results, doc) end
+        cursor = stringOrNil(response.nextPageCursor)
+        if not cursor then break end
+    end
+    return results
 end
 
 return ReaderHighlights

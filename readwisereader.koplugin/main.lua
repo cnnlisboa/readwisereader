@@ -69,6 +69,9 @@ local ReaderNote = require("library/reader_note")
 local TagFilter = require("library/tag_filter")
 local Ledger = require("library/highlight_ledger")
 local ReaderHighlightIds = require("library/reader_highlight_ids")
+local RateLimit = require("library/rate_limit")
+local BackgroundJob = require("library/background_job")
+local ExportJournal = require("library/export_journal")
 local SyncModes = require("sync_modes")
 local ReaderAPI = require("api/reader")
 local HighlightsAPI = require("api/highlights")
@@ -297,6 +300,14 @@ function ReadwiseReader:init()
     self.highlight_ledger_migrated = settings.highlight_ledger_migrated or false
     self.highlight_deletions_checked_at = settings.highlight_deletions_checked_at
     self.chapter_heading_level = settings.chapter_heading_level or "h2"
+    BackgroundJob.setup{
+        scheduler = {
+            scheduleIn = function(seconds, fn) UIManager:scheduleIn(seconds, fn) end,
+            nextTick = function(fn) UIManager:nextTick(fn) end,
+            unschedule = function(fn) UIManager:unschedule(fn) end,
+        },
+        logger = logger,
+    }
     self:initHighlightTags(settings)
     -- These two switches became Automatic / Ask / Manual modes; the booleans
     -- remain as "is it on at all" for older code paths.
@@ -308,11 +319,6 @@ function ReadwiseReader:init()
 
     -- Initialize koreader tag filter (only sync articles tagged "koreader")
     self.sync_only_koreader_tag = settings.sync_only_koreader_tag or false
-
-    -- Simple rate limiting state
-    self.api_call_count = 0
-    self.sync_start_time = nil
-    self.needs_rate_limiting = false
 
     -- Initialize highlights parser with a mock UI to satisfy new clip.lua
     -- requirements. extendProps is the one real dependency clip.lua pulls off
@@ -400,6 +406,13 @@ function ReadwiseReader:init()
     self.ui.menu:registerToMainMenu(self)
     self:registerExternalLinkAction()
     self:registerFileDialogButtons()
+
+    -- An export that stopped part-way (KOReader closed, or no instance was
+    -- on screen when it ended) left its progress in the journal. While one is
+    -- running, it hands its state over itself when it ends.
+    if not BackgroundJob.running() then
+        self:mergeExportJournal(false)
+    end
 end
 
 -- Holding a file in KOReader's library offers Reader tags and note for a
@@ -491,52 +504,45 @@ function ReadwiseReader:withFastRequests(fn)
     return result
 end
 
-function ReadwiseReader:checkRateLimit()
-    -- Only start counting after we make some API calls
-    if self.api_call_count == 0 then
-        self.sync_start_time = os.time()
-        self.api_call_count = 1
-        return
+-- Waits until `url`'s request budget allows another call
+-- (library/rate_limit.lua), then counts it. Inside the background export the
+-- wait hands KOReader its turn instead of sleeping.
+function ReadwiseReader:awaitRateLimit(method, url)
+    local bucket = RateLimit.bucket(method, url)
+    local delay = RateLimit.delay(bucket)
+    if delay > 0 then
+        logger.dbg("ReadwiseReader: rate limit, waiting", delay, "s for", bucket)
+        BackgroundJob.wait(delay, socket.sleep)
     end
-    
-    self.api_call_count = self.api_call_count + 1
-    
-    -- After 5 API calls, check if we need rate limiting
-    if self.api_call_count == 5 and not self.needs_rate_limiting then
-        local elapsed = os.time() - self.sync_start_time
-        if elapsed < 20 then -- 5 calls in under 20 seconds suggests large library
-            self.needs_rate_limiting = true
-            logger.dbg("ReadwiseReader: enabling rate limiting after", self.api_call_count, "calls in", elapsed, "seconds")
-        end
-    end
-    
-    -- Apply rate limiting if needed
-    if self.needs_rate_limiting and self.api_call_count > 3 then
-        -- Reader API limit is 20/minute, so wait 3 seconds between calls to be safe
-        logger.dbg("ReadwiseReader: applying 3 second rate limit delay")
-        socket.sleep(3)
-    end
+    RateLimit.record(bucket)
+    return bucket
 end
 
-function ReadwiseReader:handleRetryAfter(code, headers)
-    -- Handle 429 rate limit responses
-    if code == 429 then
-        local retry_after = 60 -- Default to 60 seconds
-        if headers and headers["retry-after"] then
-            retry_after = tonumber(headers["retry-after"]) or 60
-        end
-        
-        -- Enable rate limiting for future calls
-        self.needs_rate_limiting = true
-        
-        logger.warn("ReadwiseReader: hit rate limit, waiting", retry_after, "seconds")
-        self:showProgress(string.format("Rate limited, waiting %d seconds…", retry_after))
-        socket.sleep(retry_after)
-        self:hideProgress()
-        
-        return true -- Indicate we should retry
+-- After a 429: wait Retry-After (default 60 s). Returns true to retry.
+function ReadwiseReader:handleRetryAfter(code, headers, bucket)
+    if code ~= 429 then return false end
+    local retry_after = 60
+    if headers and headers["retry-after"] then
+        retry_after = tonumber(headers["retry-after"]) or 60
     end
-    return false
+    if bucket then RateLimit.block(bucket, retry_after) end
+    logger.warn("ReadwiseReader: hit rate limit, waiting", retry_after, "seconds")
+    local background = BackgroundJob.inside()
+    if not background then
+        self:showProgress(string.format("Rate limited, waiting %d seconds…", retry_after))
+    end
+    BackgroundJob.wait(retry_after, socket.sleep)
+    if not background then self:hideProgress() end
+    return true
+end
+
+-- Logs requests slow enough to matter, to find what holds the screen.
+local function logSlowRequest(method, url, started)
+    local took = RateLimit.clock() - started
+    if took >= 3 then
+        logger.info("ReadwiseReader: slow request", method, (tostring(url):gsub("%?.*$", "")),
+            string.format("%.1f s", took))
+    end
 end
 
 -- ===============================================================================
@@ -894,6 +900,7 @@ function ReadwiseReader:makeJsonRequest(endpoint, method, body, headers)
     end
     
     local source = ltn12.source.string(body_json)
+    self:awaitRateLimit(method, endpoint)
     socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
 
     local request = {
@@ -912,8 +919,11 @@ function ReadwiseReader:makeJsonRequest(endpoint, method, body, headers)
         request.headers[k] = v
     end
 
+    local started = RateLimit.clock()
     local code, __, status = socket.skip(1, http.request(request))
     socketutil:reset_timeout()
+    logSlowRequest(method, endpoint, started)
+    BackgroundJob.wait(0)
 
     if code ~= 200 then
         return nil, "Request failed: " .. (status or code or "network unreachable")
@@ -1102,9 +1112,6 @@ function ReadwiseReader:runSyncAction(action)
         if not self:validateSettings() then
             return
         end
-        self.api_call_count = 0
-        self.sync_start_time = nil
-        self.needs_rate_limiting = false
         action()
     end)
 end
@@ -1241,12 +1248,6 @@ function ReadwiseReader:buildHighlightContext(booknotes)
     }
 end
 
--- Runs the highlight export pipeline. Returns the number of highlights Readwise
--- confirmed, on a parse failure the error -- the caller words that message,
--- since "continuing with article sync" is only true on the sync path -- and
--- how many highlights failed to export. only_ids (Reader id -> true) limits
--- the export to those downloaded articles, for removing one safely. Matched
--- by id rather than path, since history may spell the path differently.
 -- Every v2 export page since `updated_after` (nil: the whole library),
 -- deleted highlights included. Returns books or nil, err.
 function ReadwiseReader:fetchV2Export(updated_after)
@@ -1302,22 +1303,125 @@ function ReadwiseReader:prepareHighlightLedger(entries)
         end
     end
     self.highlight_deletions_checked_at = started
-    self:saveSettings()
+    self:writeExportJournal()
     return true
 end
 
--- options: passed to parseAllBooks (files / since). With options.checkpoint
--- (epoch), a fully successful export records it as highlights_parsed_at, so
--- the next one reads only documents changed since.
-function ReadwiseReader:exportHighlights(only_ids, options)
-    options = options or {}
-    self:showProgress("Exporting highlights to Readwise...")
+-- -------------------------------------------------------------------------------
+-- Export journal and background export
+-- -------------------------------------------------------------------------------
+-- The export writes its progress to a small journal after every request
+-- (library/export_journal.lua), so closing KOReader part-way loses nothing
+-- and never places a highlight in Reader twice. The background export runs
+-- through library/background_job.lua.
 
+local function exportJournalStore()
+    return LuaSettings:open(DataStorage:getSettingsDir() .. "/readwisereader_export.lua")
+end
+
+function ReadwiseReader:readExportJournal()
+    local ok, journal = pcall(function() return exportJournalStore():readSetting("journal") end)
+    return ok and type(journal) == "table" and journal or nil
+end
+
+-- Writes the export's state now, with the in-flight placement markers.
+function ReadwiseReader:writeExportJournal()
+    local ok, err = pcall(function()
+        local store = exportJournalStore()
+        store:saveSetting("journal", ExportJournal.snapshot(self, self.export_inflight))
+        store:flush()
+    end)
+    if not ok then logger.warn("ReadwiseReader: could not write the export journal", err) end
+end
+
+-- Drops the journal once its state is in the main settings, keeping any
+-- in-flight markers still unconfirmed.
+function ReadwiseReader:clearExportJournal(inflight)
+    pcall(function()
+        local store = exportJournalStore()
+        if type(inflight) == "table" and next(inflight) then
+            store:saveSetting("journal", { inflight = inflight })
+        else
+            store:delSetting("journal")
+        end
+        store:flush()
+    end)
+end
+
+-- Folds a leftover journal into this instance. With save, also writes the
+-- main settings and empties the journal.
+function ReadwiseReader:mergeExportJournal(save)
+    local journal = self:readExportJournal()
+    if not journal then return end
+    ExportJournal.merge(self, journal)
+    if journal.parsed_at and (self.highlights_parsed_at or 0) < journal.parsed_at then
+        self.highlights_parsed_at = journal.parsed_at
+    end
+    if save then
+        self:saveSettings()
+        self:clearExportJournal(journal.inflight)
+    end
+end
+
+-- The plugin instance on screen: the reader's while a book is open,
+-- otherwise the file browser's. A background export can outlive the
+-- instance that started it.
+function ReadwiseReader:liveInstance()
+    local ReaderUI = require("apps/reader/readerui")
+    local ui = ReaderUI.instance or FileManager.instance
+    return ui and ui.readwisereader or nil
+end
+
+-- At the end of an export: its state goes into the main settings of the
+-- instance on screen. With none (between screens), the journal keeps it
+-- and the next instance merges it on start.
+function ReadwiseReader:finishExportState()
+    local live = self:liveInstance()
+    if live == self then
+        self:saveSettings()
+        self:clearExportJournal(self.export_inflight)
+    elseif live then
+        self:writeExportJournal()
+        live:mergeExportJournal(true)
+    else
+        self:writeExportJournal()
+    end
+end
+
+-- Placements that were in flight when KOReader stopped: Reader is asked
+-- which of them arrived. Returns doc -> key -> true for those still unknown
+-- (Reader couldn't be asked), which are not placed this time.
+function ReadwiseReader:reconcileInflightPlacements()
+    local inflight = self.export_inflight
+    if not next(inflight) then return {} end
+    local oldest
+    for _, marker in pairs(inflight) do
+        if not oldest or (marker.at or 0) < oldest then oldest = marker.at or 0 end
+    end
+    local list = self.reader_highlights_api:listSince(os.date("!%Y-%m-%dT%H:%M:%SZ", oldest - 300))
+    if not list then
+        local blocked = {}
+        for _, marker in pairs(inflight) do
+            blocked[marker.doc] = blocked[marker.doc] or {}
+            blocked[marker.doc][marker.key] = true
+        end
+        logger.warn("ReadwiseReader: couldn't check interrupted Reader placements; holding them")
+        return blocked
+    end
+    local found = ExportJournal.reconcile(self.reader_highlight_records, inflight, list)
+    logger.info("ReadwiseReader: interrupted Reader placements checked:", found, "arrived")
+    self.export_inflight = {}
+    self:writeExportJournal()
+    return {}
+end
+
+-- Reads the books and decides what to send; no network. Returns a plan for
+-- sendHighlights, or nil and (on a parse failure) the error.
+function ReadwiseReader:planHighlightExport(only_ids, options)
     local success, clippings = pcall(function() return self:parseAllBooks(options) end)
     if not success then
-        self:hideProgress()
         logger.warn("ReadwiseReader:exportHighlights: error parsing books for highlights:", clippings)
-        return 0, clippings, 0
+        return nil, clippings
     end
 
     if only_ids then
@@ -1330,12 +1434,7 @@ function ReadwiseReader:exportHighlights(only_ids, options)
     end
 
     if next(clippings) == nil then
-        self:hideProgress()
-        if options.checkpoint and not only_ids then
-            self.highlights_parsed_at = options.checkpoint
-            self:saveSettings()
-        end
-        return 0, nil, 0
+        return nil
     end
 
     -- Ledger keys for every clipping, under the title it is sent with.
@@ -1356,26 +1455,47 @@ function ReadwiseReader:exportHighlights(only_ids, options)
             end
         end
     end
-    if not self:prepareHighlightLedger(entries) then
-        self:hideProgress()
-        return 0, "Couldn't check Readwise for deleted highlights, so none were sent.", 0
-    end
 
-    -- Chapter headings for books Reader doesn't hold (D.6 / H).
+    -- Chapter headings for books Reader doesn't hold (D.6 / H). Asked here,
+    -- before anything goes to the background.
     local want_headings = false
     if not only_ids then
         self:runAutomated("chapter_headings", "Add chapter headings to your highlights in Readwise?",
             function() want_headings = true end)
     end
 
+    return {
+        clippings = clippings,
+        contexts = contexts,
+        entries = entries,
+        want_headings = want_headings,
+        only_ids = only_ids,
+        options = options,
+        stamped_files = {},
+    }
+end
+
+-- The network half of the export. Returns the number of highlights sent,
+-- an error (nil on success) and the number that failed.
+function ReadwiseReader:sendHighlights(plan)
+    local clippings, contexts, options = plan.clippings, plan.contexts, plan.options
+    local journal = self:readExportJournal()
+    self.export_inflight = journal and type(journal.inflight) == "table" and journal.inflight or {}
+
+    if not self:prepareHighlightLedger(plan.entries) then
+        return 0, "Couldn't check Readwise for deleted highlights, so none were sent.", 0
+    end
+    local blocked = self:reconcileInflightPlacements()
+    -- Sidecars and open documents belong to the instance on screen.
+    local files_owner = self:liveInstance() or self
+
     local books = {}
     local since = self.reader_placement_since
     local placement = { placed = 0, updated = 0, unplaced = 0, failures = {} }
-    local placement_ran = false
     for title, booknotes in pairs(clippings) do
         local context = contexts[title]
         local document_id = context.reader_document_id
-        if want_headings and not document_id then
+        if plan.want_headings and not document_id then
             local headings = Ledger.chapterHeadings(booknotes, self.chapter_heading_level)
             if #headings > 0 then
                 table.insert(booknotes, headings)
@@ -1385,21 +1505,35 @@ function ReadwiseReader:exportHighlights(only_ids, options)
             -- Reader placement runs first so a passage Reader refuses is
             -- already marked as a v2 fallback when the v2 export below runs.
             local records = self.reader_highlight_records[document_id] or {}
+            self.reader_highlight_records[document_id] = records
             -- A highlight that came from another reader with its Reader id
             -- is already in Reader: adopt it instead of placing a copy.
-            local annotations, save_annotations = self:annotationsForFile(booknotes.file)
             local key_for = require("highlight_tags").keyForAnnotation
+            local annotations = files_owner:annotationsForFile(booknotes.file)
             ReaderHighlightIds.adopt(annotations, records, key_for)
+            local hooks = {
+                blocked = blocked[document_id],
+                before = function(key, text, note)
+                    self.export_inflight[ExportJournal.inflightKey(document_id, key)] = {
+                        doc = document_id, key = key, text = text, note = note, at = os.time(),
+                    }
+                    self:writeExportJournal()
+                end,
+                after = function(key)
+                    self.export_inflight[ExportJournal.inflightKey(document_id, key)] = nil
+                    self:writeExportJournal()
+                end,
+            }
             local book_report = self.reader_highlights_api:exportBook(
-                document_id, context.title or "Untitled", booknotes, records, since)
-            local stamped = annotations and ReaderHighlightIds.stamp(annotations, records, key_for) or 0
+                document_id, context.title or "Untitled", booknotes, records, since, hooks)
+            -- Read again: the book may have been opened or closed meanwhile.
+            files_owner = self:liveInstance() or self
+            local fresh, save_annotations = files_owner:annotationsForFile(booknotes.file)
+            local stamped = fresh and ReaderHighlightIds.stamp(fresh, records, key_for) or 0
             if stamped > 0 then
                 save_annotations()
                 self.reader_ids_stamped = (self.reader_ids_stamped or 0) + stamped
-            end
-            if next(records) then
-                self.reader_highlight_records[document_id] = records
-                placement_ran = true
+                plan.stamped_files[booknotes.file] = true
             end
             placement.placed = placement.placed + book_report.placed
             placement.updated = placement.updated + book_report.updated
@@ -1407,7 +1541,10 @@ function ReadwiseReader:exportHighlights(only_ids, options)
             for _, failure in ipairs(book_report.failures) do
                 table.insert(placement.failures, failure)
             end
+            local book_blocked = blocked[document_id] or {}
             context.include_reader = function(clipping)
+                local key = HighlightsAPI.annotationKey(clipping)
+                if key and book_blocked[key] then return false end
                 return ReaderHighlightsAPI.sendsToV2(clipping, records, since)
             end
         end
@@ -1431,20 +1568,16 @@ function ReadwiseReader:exportHighlights(only_ids, options)
             context = context,
         })
     end
-    if placement_ran then
-        self:saveSettings()
-    end
     logger.dbg("ReadwiseReader:exportHighlights: placed in Reader", placement.placed,
         "notes updated", placement.updated, "unplaced", placement.unplaced,
         "failed", #placement.failures)
 
-    local report = self.highlights_api:export(books)
-    for _, meta in ipairs(report.accepted or {}) do
-        Ledger.recordSent(self.highlight_ledger, meta.key, meta.hash)
-    end
-    if #(report.accepted or {}) > 0 then
-        self:saveSettings()
-    end
+    local report = self.highlights_api:export(books, function(accepted)
+        for _, meta in ipairs(accepted) do
+            Ledger.recordSent(self.highlight_ledger, meta.key, meta.hash)
+        end
+        if #accepted > 0 then self:writeExportJournal() end
+    end)
     logger.dbg("ReadwiseReader:exportHighlights: sent", report.sent, "confirmed", report.confirmed,
         "skipped", #report.skipped, "failed", #report.failures)
     for _, failure in ipairs(placement.failures) do
@@ -1475,12 +1608,127 @@ function ReadwiseReader:exportHighlights(only_ids, options)
         })
     end
 
-    self:hideProgress()
-    if options.checkpoint and not only_ids and #report.failures == 0 then
+    -- Moving the mark only after a clean run means an interrupted or partly
+    -- failed export reads the same books again next time.
+    if options.checkpoint and not plan.only_ids and #report.failures == 0 and not next(blocked) then
         self.highlights_parsed_at = options.checkpoint
-        self:saveSettings()
     end
+    self:finishExportState()
     return report.confirmed + placement.placed + placement.updated, nil, #report.failures
+end
+
+-- A background export asked for while one is running: remembered and run
+-- when it ends. Files add up; a library-wide request covers everything.
+local function queueExportRequest(options)
+    local pending = BackgroundJob.pending or {}
+    if options.files and not pending.all then
+        pending.files = pending.files or {}
+        for file in pairs(options.files) do pending.files[file] = true end
+    elseif not options.files then
+        pending.all, pending.files = true, nil
+    end
+    pending.announce = pending.announce or options.announce
+    BackgroundJob.pending = pending
+end
+
+-- Runs sendHighlights as the background job, then reports, passes new
+-- Reader ids to Device Sync and starts any export asked for meanwhile.
+function ReadwiseReader:startBackgroundExport(plan)
+    local result = {}
+    local announce = plan.options.announce
+    logger.info("ReadwiseReader: highlight export continues in the background")
+    BackgroundJob.start("highlights", function()
+        local started = os.time()
+        result = { self:sendHighlights(plan) }
+        logger.info("ReadwiseReader: background highlight export took", os.time() - started, "s")
+    end, function(ok, err)
+        local live = self:liveInstance()
+        if not ok then
+            -- Whatever was sent is in the journal; the rest goes next time.
+            pcall(self.finishExportState, self)
+            UIManager:show(InfoMessage:new{
+                text = "Sending highlights stopped part-way. The rest will be sent next sync.",
+                timeout = 3,
+            })
+            logger.warn("ReadwiseReader: background export failed", err)
+        else
+            local count, export_err = result[1] or 0, result[2]
+            if export_err then
+                UIManager:show(InfoMessage:new{ text = tostring(export_err), timeout = 3 })
+            elseif count > 0 or announce then
+                UIManager:show(InfoMessage:new{
+                    text = count > 0 and string.format("Highlights sent to Readwise: %d", count)
+                        or "No new highlights to send.",
+                    timeout = 2,
+                })
+            end
+            local device_sync = live and live.ui and live.ui.device_sync
+            if device_sync and device_sync.syncPathQuietly and NetworkMgr:isOnline() then
+                for file in pairs(plan.stamped_files) do
+                    pcall(device_sync.syncPathQuietly, device_sync, file)
+                end
+            end
+        end
+        local pending = BackgroundJob.pending
+        BackgroundJob.pending = nil
+        if pending and live and NetworkMgr:isOnline() then
+            UIManager:nextTick(function()
+                local options = pending.all and {
+                    since = live.highlights_parsed_at and (live.highlights_parsed_at - 5) or nil,
+                    checkpoint = os.time(),
+                } or { files = pending.files }
+                options.background, options.announce = true, pending.announce
+                live:exportHighlights(nil, options)
+            end)
+        end
+    end)
+end
+
+-- Runs the highlight export. Returns the number of highlights sent, on a
+-- parse failure the error -- the caller words that message, since
+-- "continuing with article sync" is only true on the sync path -- how many
+-- highlights failed to export, and with options.background, "started",
+-- "queued" or nil (nothing to send).
+--
+-- only_ids (Reader id -> true) limits the export to those downloaded
+-- articles, for removing one safely. Matched by id rather than path, since
+-- history may spell the path differently. options: passed to parseAllBooks
+-- (files / since). With options.checkpoint (epoch), a fully successful
+-- export records it as highlights_parsed_at, so the next one reads only
+-- documents changed since. options.background: the network part runs in the
+-- background (see startBackgroundExport); options.announce: say so even
+-- when there was nothing to send.
+function ReadwiseReader:exportHighlights(only_ids, options)
+    options = options or {}
+    if BackgroundJob.running() then
+        if options.background and not only_ids then
+            queueExportRequest(options)
+            return 0, nil, 0, "queued"
+        end
+        return 0, "Highlights are still being sent in the background.", 1
+    end
+
+    if not options.background then
+        self:showProgress("Exporting highlights to Readwise...")
+    end
+    local plan, parse_err = self:planHighlightExport(only_ids, options)
+    if not plan then
+        self:hideProgress()
+        if parse_err then return 0, parse_err, 0 end
+        if options.checkpoint and not only_ids then
+            self.highlights_parsed_at = options.checkpoint
+            self:saveSettings()
+        end
+        return 0, nil, 0
+    end
+
+    if options.background then
+        self:startBackgroundExport(plan)
+        return 0, nil, 0, "started"
+    end
+    local sent, err, failures = self:sendHighlights(plan)
+    self:hideProgress()
+    return sent, err, failures
 end
 
 function ReadwiseReader:isDocReady()
@@ -1744,24 +1992,27 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         text = "Export highlights to Readwise",
                         callback = function()
                             self:runSyncAction(function()
-                                local exported, parse_err = self:exportHighlights()
+                                -- Only books changed since the last full
+                                -- export are read; the ledger skips what
+                                -- Readwise already has. Sending runs in the
+                                -- background and reports when done.
+                                local _, parse_err, _, state = self:exportHighlights(nil, {
+                                    since = self.highlights_parsed_at and (self.highlights_parsed_at - 5) or nil,
+                                    checkpoint = os.time(),
+                                    background = true,
+                                    announce = true,
+                                })
+                                local text
                                 if parse_err then
-                                    UIManager:show(InfoMessage:new{
-                                        text = string.format("Highlight export failed.\n%s",
-                                            tostring(parse_err)),
-                                        timeout = 5
-                                    })
+                                    text = string.format("Highlight export failed.\n%s", tostring(parse_err))
+                                elseif state == "started" then
+                                    text = "Sending highlights to Readwise in the background…"
+                                elseif state == "queued" then
+                                    text = "Highlights are already being sent; these will follow."
                                 else
-                                    -- Readwise ignores highlights it already
-                                    -- has, so zero here means "nothing new",
-                                    -- not "nothing worked".
-                                    UIManager:show(InfoMessage:new{
-                                        text = exported > 0
-                                            and string.format("Exported %d new or updated highlight(s).", exported)
-                                            or "No new highlights to export.",
-                                        timeout = 3
-                                    })
+                                    text = "No new highlights to export."
                                 end
+                                UIManager:show(InfoMessage:new{ text = text, timeout = parse_err and 5 or 2 })
                             end)
                         end,
                     },
@@ -2645,6 +2896,7 @@ function ReadwiseReader:callAPI(method, endpoint, body, quiet, base_url)
     local fast = self.fast_requests
     local max_attempts = fast and 1 or 3
     local code, resp_headers, status
+    local bucket
 
     for attempt = 1, max_attempts do
         sink = {}
@@ -2655,12 +2907,17 @@ function ReadwiseReader:callAPI(method, endpoint, body, quiet, base_url)
 
         if fast then
             socketutil:set_timeout(3, 6)
+            RateLimit.record(RateLimit.bucket(method, request.url))
         else
-            self:checkRateLimit()
+            bucket = self:awaitRateLimit(method, request.url)
             socketutil:set_timeout(10, 60)
         end
+        local started = RateLimit.clock()
         code, resp_headers, status = socket.skip(1, http.request(request))
         socketutil:reset_timeout()
+        logSlowRequest(method, request.url, started)
+        -- In the background export, KOReader gets a turn after every request.
+        BackgroundJob.wait(0)
 
         if attempt == max_attempts then break end
 
@@ -2668,9 +2925,9 @@ function ReadwiseReader:callAPI(method, endpoint, body, quiet, base_url)
             -- network layer: only the Kindle TLS "wantread" error is worth retrying
             if not tostring(status or code or ""):match("wantread") then break end
             logger.dbg("ReadwiseReader:callAPI: wantread error, attempt", attempt, "of", max_attempts)
-            socket.sleep(2)
+            BackgroundJob.wait(2, socket.sleep)
         elseif code == 429 then
-            self:handleRetryAfter(code, resp_headers)  -- sleeps for Retry-After
+            self:handleRetryAfter(code, resp_headers, bucket)  -- waits for Retry-After
         else
             break
         end
@@ -4580,6 +4837,8 @@ function ReadwiseReader:fetchAndEncodeImage(url)
 end
 
 function ReadwiseReader:showProgress(text)
+    -- The background export works while the user reads; it stays quiet.
+    if BackgroundJob.inside() then return end
     if self.progress_message then
         UIManager:close(self.progress_message)
     end
@@ -5057,7 +5316,14 @@ function ReadwiseReader:onCloseDocument()
 end
 
 function ReadwiseReader:onSuspend()
+    -- A background export stops between requests and carries on after
+    -- wake-up, once Wi-Fi is back (or tries anyway after 30 s).
+    BackgroundJob.pause()
     self:pushOpenDocumentProgress("suspend")
+end
+
+function ReadwiseReader:onResume()
+    BackgroundJob.resume(function() return NetworkMgr:isOnline() end, 30)
 end
 
 -- Seconds after opening before Reader is asked for its position: long enough
@@ -5291,11 +5557,6 @@ function ReadwiseReader:runSynchronize()
     end
 
     if info then UIManager:close(info) end
-
-    -- Reset rate limiting for new sync session
-    self.api_call_count = 0
-    self.sync_start_time = nil
-    self.needs_rate_limiting = false
 
     local sync_start_time = os.date("!%Y-%m-%dT%H:%M:%SZ")
 
