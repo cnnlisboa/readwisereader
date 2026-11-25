@@ -118,7 +118,8 @@ function BooksSync.install(R, deps)
         elseif decision == "skip" then
             return false
         end
-        if coroutine.running() then
+        local co, is_main = coroutine.running()
+        if co and not is_main then
             if Trapper:confirm(question, "Not now", "Yes") then
                 fn()
                 return true

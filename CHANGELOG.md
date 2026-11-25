@@ -23,6 +23,13 @@ v2.6 (via [Endle/readwisereader](https://github.com/Endle/readwisereader)). Vers
   download (they were held back until already on the device).
 
 ### Changed
+- **Highlights send faster and in the background.** Requests wait only when that endpoint's own
+  Readwise limit is close, instead of 3 s before nearly every call (12 highlights placed in Reader
+  took 75 s on a Boox). After closing a book, and from "Export highlights to Readwise", sending
+  runs in the background while you keep reading, pauses while the device sleeps, and reports when
+  done. Its progress is saved after every request, so closing KOReader part-way loses nothing and
+  never places a highlight in Reader twice. The menu export now reads only books changed since the
+  last export.
 - Closing a book syncs only that book (highlights, notes, tags, book note) instead of everything,
   and the position is sent every 10 pages while reading. **Automatic sync** chooses.
 - Sync reading data reads highlights only from books changed since the last sync, checks

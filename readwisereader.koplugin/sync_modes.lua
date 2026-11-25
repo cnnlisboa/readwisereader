@@ -313,7 +313,6 @@ function SyncModes.install(R, deps)
 
     function R:runReadingDataSync()
         if not self:validateSettings() then return end
-        self.api_call_count, self.sync_start_time, self.needs_rate_limiting = 0, nil, false
         local reading = self:syncReadingData()
         local lines = reading.lines
         local books_line = booksLine(reading.books_report)
@@ -354,7 +353,6 @@ function SyncModes.install(R, deps)
 
     function R:runBooksSync()
         if not self:validateSettings() then return end
-        self.api_call_count, self.sync_start_time, self.needs_rate_limiting = 0, nil, false
         local reading = self:syncReadingData("books")
         local lines = reading.lines
 
@@ -416,10 +414,11 @@ function SyncModes.install(R, deps)
         local lines = {}
         self.reader_ids_stamped = 0
         if self:automationMode("send_highlights") == "auto" then
-            local exported = step("highlights (one book)", function()
-                return self:exportHighlights(nil, { files = { [filepath] = true } })
+            -- Sending runs in the background (it can take a while when Reader
+            -- has to place many passages), and reports when done.
+            step("highlights (one book)", function()
+                return self:exportHighlights(nil, { files = { [filepath] = true }, background = true })
             end)
-            if exported and exported > 0 then table.insert(lines, string.format("Highlights sent: %d", exported)) end
         end
         if self:automationMode("highlight_tags") == "auto" then
             local tags = step("highlight tags", function() return self:applyPendingHighlightTags() end)

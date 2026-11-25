@@ -230,7 +230,11 @@ end
 --   confirmed -- highlights Readwise reported as created or updated
 --   skipped   -- highlights rejected locally, with the reason
 --   failures  -- highlights the server rejected, with the reason
-function Highlights:export(books)
+--
+-- on_flush(accepted_metas), when given, runs after every request with the
+-- bookkeeping of the highlights that request got accepted, so a caller can
+-- save progress before the next one.
+function Highlights:export(books, on_flush)
     local report = { sent = 0, confirmed = 0, skipped = {}, failures = {}, accepted = {} }
     local queue = {}
 
@@ -243,10 +247,15 @@ function Highlights:export(books)
         for _, failure in ipairs(failures) do
             table.insert(report.failures, failure)
         end
+        local metas = {}
         for _, entry in ipairs(accepted or {}) do
-            if entry.meta then table.insert(report.accepted, entry.meta) end
+            if entry.meta then
+                table.insert(report.accepted, entry.meta)
+                table.insert(metas, entry.meta)
+            end
         end
         queue = {}
+        if on_flush then on_flush(metas) end
     end
 
     for _, book in ipairs(books) do
